@@ -1,324 +1,462 @@
-import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext
-import cv2
-import numpy as np
-import random
+"""
+Doku-Uyarlamalı (Content-Adaptive) DCT-QIM Steganografi  —  v2
+================================================================
+* Veri yalnızca MAVİ (B) kanalın 8x8 DCT bloklarına (2 orta frekans katsayısı) gömülür.
+* "Karışık / dokulu" bölge skoru, HİÇ DEĞİŞTİRİLMEYEN R ve G kanallarından hesaplanır
+  → çözücü aynı doku haritasını stego görüntüde yeniden üretebilir.
+* Bit → yuva eşlemesi şifreden türetilen SABİT bir haritadır (doku seçimi buna karışmaz).
+  Kodlayıcı her bitin yuvalarından yalnızca dokulu olanlara gömer, düz bloklara dokunmaz.
+  Çözücü doku ağırlıklı yumuşak oylama yapar: düz blokların oyu ≈ 0.
+  Böylece doku skoru biraz değişse bile (gürültü vb.) senkronizasyon kaybolmaz.
+* Şifreleme: PBKDF2 (200k iterasyon, tuzlu) + AES-256-GCM (kimlik doğrulamalı).
+
+Gereksinimler: pip install opencv-python numpy pycryptodome
+"""
+
 import os
 import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox, scrolledtext
+
+import cv2
+import numpy as np
 from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad, unpad
+from Crypto.Protocol.KDF import PBKDF2
 from Crypto.Hash import SHA256
+from Crypto.Random import get_random_bytes
 
 # ==========================================
-# PART 1: CORE HELPER FUNCTIONS
+# AYARLAR
 # ==========================================
+BLOCK = 8
+COEFS = [(4, 1), (1, 4)]   # Blok başına kullanılan orta frekans katsayıları (satır, sütun)
+SLOTS_PER_BIT = 3          # Her bit için ayrılan (blok, katsayı) yuvası sayısı
+TEXTURE_PERCENTILE = 50    # Skoru bu yüzdeliğin altındaki bloklara normalde DOKUNULMAZ
+Q_STEP = 24.0              # QIM kuantizasyon adımı (sadece dokulu bloklara uygulanır)
+MIN_MARGIN = 0.6           # Kodlayıcının istediği en düşük ağırlıklı oy farkı
+HEADER_BITS = 32           # Yük uzunluğu (bit) başlığı
+KDF_ITER = 200_000
+MAP_SALT = b"stego-dct-map-v2"
+SALT_LEN, NONCE_LEN, TAG_LEN = 16, 12, 16
+OVERHEAD = SALT_LEN + NONCE_LEN + TAG_LEN
 
+
+# ==========================================
+# 1) DOSYA G/Ç (Unicode güvenli)
+# ==========================================
 def read_image_unicode(path):
-    """
-    Reads images from paths containing special/Unicode characters.
-    Standard cv2.imread fails with non-ASCII paths on Windows.
-    """
+    """Türkçe karakterli yollarda da çalışır. Her zaman 8-bit BGR döndürür."""
     try:
-        with open(path, "rb") as f:
-            bytes_data = bytearray(f.read())
-            numpy_array = np.asarray(bytes_data, dtype=np.uint8)
-            image = cv2.imdecode(numpy_array, cv2.IMREAD_UNCHANGED)
-            return image
+        data = np.fromfile(path, dtype=np.uint8)
+        return cv2.imdecode(data, cv2.IMREAD_COLOR)   # alfa/16-bit/gri → 3 kanal 8-bit
     except Exception as e:
         print(f"Image Read Error: {e}")
         return None
 
+
 def save_image_unicode(path, img):
-    """Saves images to paths containing special/Unicode characters."""
-    try:
-        ext = os.path.splitext(path)[1]
-        result, n = cv2.imencode(ext, img)
-        if result:
-            with open(path, mode='wb') as f:
-                n.tofile(f)
-            return True
-        return False
-    except:
-        return False
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in (".png", ".bmp", ".tif", ".tiff"):
+        raise ValueError("Stego görüntü kayıpsız formatta (PNG/BMP/TIFF) kaydedilmeli; "
+                         "JPEG sıkıştırması gömülü veriyi bozar.")
+    ok, buf = cv2.imencode(ext, img)
+    if ok:
+        buf.tofile(path)
+    return ok
 
-def encrypt_aes(plain_text, password):
-    """Encrypts text using AES-256 (CBC Mode)."""
-    key = SHA256.new(password.encode('utf-8')).digest()
-    cipher = AES.new(key, AES.MODE_CBC)
-    iv = cipher.iv
-    encrypted_bytes = cipher.encrypt(pad(plain_text.encode('utf-8'), AES.block_size))
-    return iv + encrypted_bytes
-
-def decrypt_aes(encrypted_data_with_iv, password):
-    """Decrypts AES-256 encrypted bytes."""
-    try:
-        key = SHA256.new(password.encode('utf-8')).digest()
-        iv = encrypted_data_with_iv[:16]
-        ciphertext = encrypted_data_with_iv[16:]
-        cipher = AES.new(key, AES.MODE_CBC, iv)
-        return unpad(cipher.decrypt(ciphertext), AES.block_size).decode('utf-8')
-    except:
-        return None # Return None if decryption fails (Wrong Key/IV)
-
-def bytes_to_binary(byte_data):
-    """Converts bytes to a binary string (0s and 1s)."""
-    bit_string = ''.join(format(byte, '08b') for byte in byte_data)
-    length = len(bit_string)
-    length_bin = format(length, '032b') # 32-bit header for length
-    return length_bin + bit_string
 
 # ==========================================
-# PART 2: ENCODER (HIDING DATA)
+# 2) KRİPTO  (PBKDF2 + AES-256-GCM)
 # ==========================================
+def _kdf(password, salt, n=32, it=KDF_ITER):
+    return PBKDF2(password, salt, dkLen=n, count=it, hmac_hash_module=SHA256)
 
-def embed_data(image_path, output_path, secret_text, password):
-    # Read image using unicode-safe function
+
+def encrypt_payload(plain_text, password):
+    """Çıktı: salt | nonce | tag | ciphertext"""
+    salt, nonce = get_random_bytes(SALT_LEN), get_random_bytes(NONCE_LEN)
+    cipher = AES.new(_kdf(password, salt), AES.MODE_GCM, nonce=nonce)
+    ct, tag = cipher.encrypt_and_digest(plain_text.encode("utf-8"))
+    return salt + nonce + tag + ct
+
+
+def decrypt_payload(blob, password):
+    if len(blob) < OVERHEAD:
+        return None
+    salt, nonce = blob[:SALT_LEN], blob[SALT_LEN:SALT_LEN + NONCE_LEN]
+    tag, ct = blob[SALT_LEN + NONCE_LEN:OVERHEAD], blob[OVERHEAD:]
+    try:
+        cipher = AES.new(_kdf(password, salt), AES.MODE_GCM, nonce=nonce)
+        return cipher.decrypt_and_verify(ct, tag).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+# ==========================================
+# 3) DOKU HARİTASI
+# ==========================================
+def block_texture(img):
+    """
+    Her 8x8 blok için 'karmaşıklık' skoru. SADECE R ve G kanalları kullanılır
+    (veri B kanalına gömüldüğü için R,G stego görüntüde aynen kalır).
+
+        skor = std(G) + std(R) + std(R - G)
+               └ parlaklık dokusu ┘   └ renk karışıklığı
+    """
+    h, w = img.shape[:2]
+    bh, bw = h // BLOCK, w // BLOCK
+    crop = img[:bh * BLOCK, :bw * BLOCK].astype(np.float32)
+    G, R = crop[:, :, 1], crop[:, :, 2]
+
+    def blocks(ch):
+        return ch.reshape(bh, BLOCK, bw, BLOCK).swapaxes(1, 2)
+
+    g, r = blocks(G), blocks(R)
+    score = (g.std(axis=(2, 3)) + r.std(axis=(2, 3)) + (r - g).std(axis=(2, 3))).reshape(-1)
+    return score, bw
+
+
+def texture_params(score):
+    """Eşik T, her blok için oy ağırlığı w ve kuantizasyon adımı Q."""
+    T = max(float(np.percentile(score, TEXTURE_PERCENTILE)), 1.0)
+    rel = score / T
+    w = np.where(rel >= 1.0, 1.0, rel ** 4)            # düz blokların oyu ≈ 0
+    q = np.full(score.shape, Q_STEP)
+    return T, w, q
+
+
+def slot_map(n_blocks, password):
+    """
+    Şifreden türetilmiş SABİT yuva haritası: (blok, katsayı) çiftlerinin karışık sırası.
+    Doku haritasından bağımsız olduğu için gürültü vs. senkronizasyonu bozamaz.
+    """
+    seed = _kdf(password, MAP_SALT, n=16, it=KDF_ITER // 4)
+    rng = np.random.default_rng(int.from_bytes(seed, "big"))
+    slots = np.arange(n_blocks * len(COEFS))
+    rng.shuffle(slots)
+    return slots   # slot -> blok = s // len(COEFS), katsayı = COEFS[s % len(COEFS)]
+
+
+# ==========================================
+# 3b) HATA DÜZELTME: Hamming(7,4)  — her 7 bitlik kod sözcüğünde 1 hatayı düzeltir
+# ==========================================
+_G = np.array([[1,1,0,1],[1,0,1,1],[1,0,0,0],[0,1,1,1],[0,1,0,0],[0,0,1,0],[0,0,0,1]], np.uint8)
+_H = np.array([[1,0,1,0,1,0,1],[0,1,1,0,0,1,1],[0,0,0,1,1,1,1]], np.uint8)
+_DATA_POS = [2, 4, 5, 6]
+
+
+def hamming_encode(bits):
+    bits = np.concatenate([bits, np.zeros((-len(bits)) % 4, np.uint8)])
+    return (bits.reshape(-1, 4) @ _G.T % 2).astype(np.uint8).ravel()
+
+
+def hamming_decode(code):
+    c = code.reshape(-1, 7).copy()
+    syn = (c @ _H.T % 2) @ np.array([1, 2, 4])          # hatalı bitin konumu (1..7), 0 = hata yok
+    rows = np.where(syn > 0)[0]
+    c[rows, syn[rows] - 1] ^= 1
+    return c[:, _DATA_POS].ravel()
+
+
+def coded_len(n_bits):
+    return -(-n_bits // 4) * 7
+
+
+# ==========================================
+# 4) QIM
+# ==========================================
+def _qim_embed(c, bit, q):
+    if bit == 0:
+        return np.round(c / q) * q
+    return np.round((c - q / 2) / q) * q + q / 2
+
+
+def _qim_detect(c, q):
+    d0 = abs(c - np.round(c / q) * q)
+    d1 = abs(c - (np.round((c - q / 2) / q) * q + q / 2))
+    return 1 if d1 < d0 else 0
+
+
+def _block_xy(b, bw):
+    return (b // bw) * BLOCK, (b % bw) * BLOCK
+
+
+def _detect_slot(chan, s, bw, q):
+    b, k = divmod(int(s), len(COEFS))
+    y, x = _block_xy(b, bw)
+    u, v = COEFS[k]
+    return _qim_detect(cv2.dct(chan[y:y + BLOCK, x:x + BLOCK].astype(np.float32))[u, v], q[b])
+
+
+def _read_bit(chan, row, bw, w, q):
+    """Doku ağırlıklı yumuşak oylama. Düz (dokunulmamış) blokların oyu neredeyse sıfır."""
+    acc = 0.0
+    for s in row:
+        b = int(s) // len(COEFS)
+        acc += w[b] * (1 if _detect_slot(chan, s, bw, q) else -1)
+    return 1 if acc > 0 else 0
+
+
+def _write_block(chan, b, bw, targets, q):
+    """targets: {katsayı_indeksi: bit}. Bloğun tüm hedef katsayıları tek seferde yazılır."""
+    y, x = _block_xy(b, bw)
+    d = cv2.dct(chan[y:y + BLOCK, x:x + BLOCK].astype(np.float32))
+    for k, bit in targets.items():
+        u, v = COEFS[k]
+        d[u, v] = _qim_embed(d[u, v], bit, q)
+    out = np.clip(np.round(cv2.idct(d)), 0, 255)   # ← orijinal kodda eksikti (taşma hatası)
+    chan[y:y + BLOCK, x:x + BLOCK] = out.astype(np.uint8)
+
+
+# ==========================================
+# 5) ENCODER / DECODER
+# ==========================================
+def capacity_bytes(img):
+    n_slots = (img.shape[0] // BLOCK) * (img.shape[1] // BLOCK) * len(COEFS)
+    raw_bits = (n_slots // SLOTS_PER_BIT) * 4 // 7 - HEADER_BITS
+    return max(0, raw_bits // 8 - OVERHEAD)
+
+
+def embed_bytes(img, blob, password):
+    """Bellekte gömme. (stego, kullanılan_bloklar, istatistik) döndürür."""
+    bits = np.unpackbits(np.frombuffer(blob, np.uint8))
+    header = np.array([int(c) for c in format(bits.size, f"0{HEADER_BITS}b")], np.uint8)
+    all_bits = hamming_encode(np.concatenate([header, bits]))
+
+    score, bw = block_texture(img)
+    T, w, q = texture_params(score)
+    slots = slot_map(score.size, password)
+    if all_bits.size * SLOTS_PER_BIT > slots.size:
+        raise ValueError(f"Message is too long! Capacity ≈ {capacity_bytes(img)} bytes of text.")
+
+    stego = img.copy()
+    chan = stego[:, :, 0]                          # B kanalı
+    plan = {}                                      # blok -> {katsayı: bit}
+    forced = 0
+    for i, bit in enumerate(all_bits):
+        row = slots[i * SLOTS_PER_BIT:(i + 1) * SLOTS_PER_BIT]
+        blocks = [int(s) // len(COEFS) for s in row]
+        # 1) Dokulu yuvalara göm
+        chosen = [j for j, b in enumerate(blocks) if score[b] >= T]
+        # 2) Kodlayıcı, çözücünün ağırlıklı oyunu simüle eder; fark yetersizse
+        #    kalan yuvaları en dokuludan başlayarak ekler (nadiren düz bloğa dokunur).
+        rest = sorted(set(range(len(row))) - set(chosen), key=lambda j: -score[blocks[j]])
+        while True:
+            tot = sum(w[b] for b in blocks)
+            agree = sum(w[blocks[j]] for j in chosen)
+            for j in rest:                          # dokunulmayan yuvaların doğal oyu
+                if j in chosen:
+                    continue
+                agree += w[blocks[j]] * (1 if _detect_slot(img[:, :, 0], row[j], bw, q) == bit else 0)
+            margin = (2 * agree - tot) / tot if tot > 0 else -1
+            if margin >= MIN_MARGIN or len(chosen) == len(row):
+                break
+            j = next(j for j in rest if j not in chosen)
+            chosen.append(j)
+            forced += score[blocks[j]] < T
+        for j in chosen:
+            b, k = divmod(int(row[j]), len(COEFS))
+            plan.setdefault(b, {})[k] = int(bit)
+
+    for b, targets in plan.items():
+        _write_block(chan, b, bw, targets, q[b])
+
+    return stego, np.array(sorted(plan)), {"used": len(plan), "total": score.size, "forced_flat": forced}
+
+
+def extract_bytes(img, password):
+    score, bw = block_texture(img)      # R,G değişmediği için aynı (veya çok yakın) harita
+    _, w, q = texture_params(score)
+    slots = slot_map(score.size, password)
+    chan = img[:, :, 0]
+
+    def bit_at(i):
+        return _read_bit(chan, slots[i * SLOTS_PER_BIT:(i + 1) * SLOTS_PER_BIT], bw, w, q)
+
+    hc = coded_len(HEADER_BITS)                       # başlık 4'ün katı → kendi kod sözcükleri
+    header = hamming_decode(np.array([bit_at(i) for i in range(hc)], np.uint8))
+    L = int("".join(map(str, header)), 2)
+    total = coded_len(HEADER_BITS + L)
+    if L < OVERHEAD * 8 or L % 8 or total * SLOTS_PER_BIT > slots.size:
+        return None
+    code = np.array([bit_at(i) for i in range(total)], np.uint8)
+    bits = hamming_decode(code)[HEADER_BITS:HEADER_BITS + L]
+    return np.packbits(bits).tobytes()
+
+
+def embed_data(image_path, output_path, secret_text, password, map_path=None):
     img = read_image_unicode(image_path)
     if img is None:
-        return f"ERROR: Could not read image!\nPath: {image_path}\n(Check file path and permissions.)"
-
-    stego_img = img.copy()
-    height, width = img.shape[:2]
-    
-    # Check for Color Channel
-    if len(img.shape) > 2:
-        b_channel = img[:, :, 0].astype(np.float32)
-    else:
-        return "ERROR: Please select a color image (JPG/PNG)."
-
-    # Encrypt the message
+        return f"ERROR: Could not read image!\nPath: {image_path}"
     try:
-        encrypted_data = encrypt_aes(secret_text, password)
-    except Exception as e:
-        return f"Encryption Error: {str(e)}"
+        stego, used, st = embed_bytes(img, encrypt_payload(secret_text, password), password)
+    except ValueError as e:
+        return f"ERROR: {e}"
 
-    full_data_bits = bytes_to_binary(encrypted_data)
-    data_length = len(full_data_bits)
-    
-    # Settings (Robust & Secure)
-    Q = 15          # Quantization Step
-    U, V = 4, 1     # Middle Frequency Coordinate
-    total_blocks = (height // 8) * (width // 8)
-    
-    # Capacity Check (1 bit needs 3 blocks for redundancy)
-    if data_length * 3 > total_blocks:
-        return f"ERROR: Message is too long! ({data_length} bits)\nIt does not fit in this image."
-
-    # Generate Random Map based on Password (Seed)
-    block_map = list(range(total_blocks))
-    random.seed(password)
-    random.shuffle(block_map)
-    
-    # Embedding Loop
-    for i in range(data_length):
-        bit = int(full_data_bits[i])
-        indices = [block_map[i*3], block_map[i*3+1], block_map[i*3+2]]
-        
-        for idx in indices:
-            row, col = idx // (width // 8), idx % (width // 8)
-            y, x = row * 8, col * 8
-            
-            block = b_channel[y:y+8, x:x+8]
-            dct_block = cv2.dct(block)
-            
-            # QIM (Quantization Index Modulation)
-            coeff = dct_block[U, V]
-            if bit == 0:
-                new_coeff = round(coeff / Q) * Q
-            else:
-                new_coeff = round((coeff - (Q/2)) / Q) * Q + (Q/2)
-                
-            dct_block[U, V] = new_coeff
-            stego_img[y:y+8, x:x+8, 0] = cv2.idct(dct_block)
-
-    # Save Stego Image
-    success = save_image_unicode(output_path, stego_img)
-    if success:
-        return "Success"
-    else:
+    ok = extract_bytes(stego, password) is not None and \
+        decrypt_payload(extract_bytes(stego, password), password) == secret_text
+    if not save_image_unicode(output_path, stego):
         return f"ERROR: Could not save image!\nPath: {output_path}"
+    if map_path:
+        _, bw = block_texture(img)
+        save_usage_map(img, used, bw, map_path)
+    return (f"Success\nModified blocks: {st['used']}/{st['total']} "
+            f"(%{100 * st['used'] / st['total']:.1f}); low-texture blocks touched: {st['forced_flat']}\n"
+            f"Self-check: {'OK' if ok else 'FAILED'}")
 
-# ==========================================
-# PART 3: DECODER (EXTRACTING DATA)
-# ==========================================
 
 def extract_data(image_path, password):
     img = read_image_unicode(image_path)
     if img is None:
         return f"ERROR: Could not read image!\nPath: {image_path}"
-
-    height, width = img.shape[:2]
-    if len(img.shape) > 2:
-        b_channel = img[:, :, 0].astype(np.float32)
-    else:
-        return "ERROR: Color image required."
-    
-    Q, U, V = 15, 4, 1
-    total_blocks = (height // 8) * (width // 8)
-    
-    block_map = list(range(total_blocks))
-    random.seed(password)
-    random.shuffle(block_map)
-    
-    # Distributed Voting Mechanism
-    def get_vote(bit_idx):
-        indices = [block_map[bit_idx*3], block_map[bit_idx*3+1], block_map[bit_idx*3+2]]
-        votes = []
-        for idx in indices:
-            row, col = idx // (width // 8), idx % (width // 8)
-            y, x = row * 8, col * 8
-            dct = cv2.dct(b_channel[y:y+8, x:x+8])
-            val = dct[U, V]
-            
-            # Distance to nearest '0' or '1'
-            d0 = abs(val - round(val / Q) * Q)
-            d1 = abs(val - (round((val - (Q/2)) / Q) * Q + (Q/2)))
-            votes.append(1 if d1 < d0 else 0)
-        
-        # Majority Vote (2 out of 3)
-        return '1' if sum(votes) >= 2 else '0'
-
-    # Read Header (First 32 bits)
-    header_bits = ""
-    for i in range(32):
-        header_bits += get_vote(i)
-        
-    try:
-        length = int(header_bits, 2)
-    except:
-        return "ERROR: Could not read data header."
-
-    # Sanity Check
-    if length > 50000 or length <= 0:
-        return "ERROR: Wrong password or no data found in image."
-
-    # Read Payload
-    payload_bits = ""
-    for i in range(32, 32 + length):
-        payload_bits += get_vote(i)
-        
-    encrypted_bytes = bytearray()
-    for i in range(0, len(payload_bits), 8):
-        chunk = payload_bits[i:i+8]
-        if len(chunk) == 8:
-            try:
-                encrypted_bytes.append(int(chunk, 2))
-            except: pass
-            
-    # Decrypt AES
-    result = decrypt_aes(bytes(encrypted_bytes), password)
+    blob = extract_bytes(img, password)
+    if blob is None:
+        return "ERROR: Wrong password or no hidden data in this image."
+    result = decrypt_payload(blob, password)
     if result is None:
-        return "ERROR: Password (Seed) was correct, but AES Key was wrong.\nData might be corrupted or password typo."
+        return "ERROR: Authentication failed (wrong password or corrupted image)."
     return result
 
-# ==========================================
-# PART 4: GUI (USER INTERFACE)
-# ==========================================
 
+# ==========================================
+# 6) GÖRSELLEŞTİRME (rapor/sunum için)
+# ==========================================
+def save_usage_map(img, used_idx, bw, path):
+    """Değiştirilen blokları yeşil ile işaretleyen bindirme görüntüsü."""
+    vis = (img.astype(np.float32) * 0.45).astype(np.uint8)
+    for idx in np.unique(used_idx):
+        y, x = (idx // bw) * BLOCK, (idx % bw) * BLOCK
+        vis[y:y + BLOCK, x:x + BLOCK] = (0.5 * img[y:y + BLOCK, x:x + BLOCK]
+                                         + 0.5 * np.array([0, 255, 0])).astype(np.uint8)
+    ok, buf = cv2.imencode(".png", vis)
+    if ok:
+        buf.tofile(path)
+
+
+def psnr(a, b):
+    mse = np.mean((a.astype(np.float64) - b.astype(np.float64)) ** 2)
+    return float("inf") if mse == 0 else 10 * np.log10(255 ** 2 / mse)
+
+
+# ==========================================
+# 7) GUI
+# ==========================================
 class StegoApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("AES Steganography Tool (Final)")
-        self.root.geometry("600x520")
+        self.root.title("AES Steganography Tool v2 (Texture-Adaptive)")
+        self.root.geometry("620x580")
         self.root.configure(bg="#1e1e1e")
+        self.file_path = None
         self.setup_ui()
 
     def setup_ui(self):
-        # Header
-        tk.Label(self.root, text="AES Crypto-Stego Station", fg="#00ff00", bg="#1e1e1e", font=("Courier", 18, "bold")).pack(pady=15)
-        
-        # Mode Toggle
+        tk.Label(self.root, text="AES Crypto-Stego Station v2", fg="#00ff00", bg="#1e1e1e",
+                 font=("Courier", 18, "bold")).pack(pady=15)
         self.mode = tk.StringVar(value="ENCODE")
-        toggle_frame = tk.Frame(self.root, bg="#1e1e1e")
-        toggle_frame.pack(pady=5)
-        
-        tk.Radiobutton(toggle_frame, text="HIDE DATA (ENCODE)", variable=self.mode, value="ENCODE", 
-                       fg="#00ff00", bg="#1e1e1e", selectcolor="#333", activebackground="#1e1e1e", activeforeground="#00ff00",
-                       font=("Arial", 10, "bold"), command=self.refresh).pack(side="left", padx=15)
-                       
-        tk.Radiobutton(toggle_frame, text="REVEAL DATA (DECODE)", variable=self.mode, value="DECODE", 
-                       fg="#ff3333", bg="#1e1e1e", selectcolor="#333", activebackground="#1e1e1e", activeforeground="#ff3333",
-                       font=("Arial", 10, "bold"), command=self.refresh).pack(side="left", padx=15)
-
-        # Content Frame
-        self.main_frame = tk.Frame(self.root, bg="#252526", padx=20, pady=20, relief="flat", bd=2)
+        tf = tk.Frame(self.root, bg="#1e1e1e"); tf.pack(pady=5)
+        for text, val, col in (("HIDE DATA (ENCODE)", "ENCODE", "#00ff00"),
+                               ("REVEAL DATA (DECODE)", "DECODE", "#ff3333")):
+            tk.Radiobutton(tf, text=text, variable=self.mode, value=val, fg=col, bg="#1e1e1e",
+                           selectcolor="#333", activebackground="#1e1e1e", activeforeground=col,
+                           font=("Arial", 10, "bold"), command=self.refresh).pack(side="left", padx=15)
+        self.main_frame = tk.Frame(self.root, bg="#252526", padx=20, pady=20)
         self.main_frame.pack(expand=True, fill="both", padx=20, pady=10)
-        
         self.refresh()
 
     def refresh(self):
-        # Clear frame
-        for w in self.main_frame.winfo_children(): w.destroy()
-        
-        # Dynamic Button Text
-        btn_text = "Select Image (to Hide)" if self.mode.get() == "ENCODE" else "Select Image (to Reveal)"
-        tk.Button(self.main_frame, text=btn_text, command=self.select_file, 
-                  width=25, bg="#444", fg="white", font=("Arial", 10)).pack(pady=5)
-                  
-        self.lbl_path = tk.Label(self.main_frame, text="No file selected", fg="#aaa", bg="#252526", font=("Arial", 9, "italic"))
+        for w in self.main_frame.winfo_children():
+            w.destroy()
+        enc = self.mode.get() == "ENCODE"
+        tk.Button(self.main_frame, text="Select Image (to Hide)" if enc else "Select Image (to Reveal)",
+                  command=self.select_file, width=25, bg="#444", fg="white").pack(pady=5)
+        self.lbl_path = tk.Label(self.main_frame, text=os.path.basename(self.file_path) if self.file_path
+                                 else "No file selected", fg="#aaa", bg="#252526",
+                                 font=("Arial", 9, "italic"))
         self.lbl_path.pack()
-
-        tk.Label(self.main_frame, text="Password (Seed):", fg="white", bg="#252526", font=("Arial", 10, "bold")).pack(pady=(15,0))
-        self.ent_pwd = tk.Entry(self.main_frame, show="*", width=35, bg="#333", fg="white", insertbackground="white")
+        tk.Label(self.main_frame, text="Password:", fg="white", bg="#252526",
+                 font=("Arial", 10, "bold")).pack(pady=(15, 0))
+        self.ent_pwd = tk.Entry(self.main_frame, show="*", width=35, bg="#333", fg="white",
+                                insertbackground="white")
         self.ent_pwd.pack(pady=5)
 
-        if self.mode.get() == "ENCODE":
-            tk.Label(self.main_frame, text="Secret Message:", fg="white", bg="#252526", font=("Arial", 10, "bold")).pack(pady=(10,0))
-            # Matrix Style Input
-            self.txt_msg = scrolledtext.ScrolledText(self.main_frame, height=6, width=55, 
-                                                     bg="#333", fg="#00ff00", insertbackground="white", 
-                                                     font=("Consolas", 10))
-            self.txt_msg.pack(pady=5)
-            tk.Button(self.main_frame, text="🔒 ENCRYPT & HIDE", bg="#2e7d32", fg="white", 
-                      font=("Arial", 11, "bold"), width=20, command=self.run).pack(pady=15)
-        else:
-            tk.Label(self.main_frame, text="Decoded Message:", fg="white", bg="#252526", font=("Arial", 10, "bold")).pack(pady=(10,0))
-            # Matrix Style Output
-            self.txt_res = scrolledtext.ScrolledText(self.main_frame, height=6, width=55, 
-                                                     state="disabled", bg="#333", fg="#00ff00", 
-                                                     font=("Consolas", 10))
-            self.txt_res.pack(pady=5)
-            tk.Button(self.main_frame, text="🔓 DECRYPT & REVEAL", bg="#c62828", fg="white", 
-                      font=("Arial", 11, "bold"), width=20, command=self.run).pack(pady=15)
+        tk.Label(self.main_frame, text="Secret Message:" if enc else "Decoded Message:",
+                 fg="white", bg="#252526", font=("Arial", 10, "bold")).pack(pady=(10, 0))
+        self.txt = scrolledtext.ScrolledText(self.main_frame, height=6, width=55, bg="#333",
+                                             fg="#00ff00", insertbackground="white",
+                                             font=("Consolas", 10))
+        self.txt.pack(pady=5)
+        if not enc:
+            self.txt.config(state="disabled")
+        self.show_map = tk.BooleanVar(value=True)
+        if enc:
+            tk.Checkbutton(self.main_frame, text="Also save block-usage map", variable=self.show_map,
+                           fg="white", bg="#252526", selectcolor="#333",
+                           activebackground="#252526").pack()
+        self.btn = tk.Button(self.main_frame, text="🔒 ENCRYPT & HIDE" if enc else "🔓 DECRYPT & REVEAL",
+                             bg="#2e7d32" if enc else "#c62828", fg="white",
+                             font=("Arial", 11, "bold"), width=20, command=self.run)
+        self.btn.pack(pady=10)
+        self.lbl_status = tk.Label(self.main_frame, text="", fg="#aaa", bg="#252526", justify="left")
+        self.lbl_status.pack()
 
     def select_file(self):
-        self.file_path = filedialog.askopenfilename(filetypes=[("Image Files", "*.jpg *.png *.jpeg *.bmp")])
-        if self.file_path: self.lbl_path.config(text=os.path.basename(self.file_path))
+        p = filedialog.askopenfilename(filetypes=[("Image Files", "*.png *.bmp *.jpg *.jpeg *.tif *.tiff")])
+        if p:
+            self.file_path = p
+            self.lbl_path.config(text=os.path.basename(p))
+            img = read_image_unicode(p)
+            if img is not None and self.mode.get() == "ENCODE":
+                self.lbl_status.config(text=f"{img.shape[1]}x{img.shape[0]} — capacity ≈ "
+                                            f"{capacity_bytes(img)} bytes")
 
     def run(self):
         pwd = self.ent_pwd.get()
-        if not hasattr(self, 'file_path') or not pwd:
+        if not self.file_path or not pwd:
             return messagebox.showerror("Error", "Please select an image and enter a password.")
-        
-        # Run in separate thread to keep GUI responsive
-        threading.Thread(target=self.process_thread, args=(pwd,)).start()
+        out = map_path = None
+        if self.mode.get() == "ENCODE":
+            msg = self.txt.get("1.0", tk.END).strip()
+            if not msg:
+                return messagebox.showwarning("Warning", "Secret message cannot be empty.")
+            base = os.path.splitext(os.path.basename(self.file_path))[0]
+            out = filedialog.asksaveasfilename(defaultextension=".png", initialfile=f"{base}_stego.png",
+                                               filetypes=[("PNG", "*.png"), ("BMP", "*.bmp")])
+            if not out:
+                return
+            if self.show_map.get():
+                map_path = os.path.splitext(out)[0] + "_map.png"
+        else:
+            msg = None
+        self.btn.config(state="disabled")
+        self.lbl_status.config(text="Working... (key derivation takes a moment)")
+        threading.Thread(target=self.worker, args=(pwd, msg, out, map_path), daemon=True).start()
 
-    def process_thread(self, password):
+    def worker(self, pwd, msg, out, map_path):
         try:
-            if self.mode.get() == "ENCODE":
-                msg = self.txt_msg.get("1.0", tk.END).strip()
-                if not msg: 
-                    messagebox.showwarning("Warning", "Secret message cannot be empty.")
-                    return
-                
-                folder = os.path.dirname(self.file_path)
-                output_path = os.path.join(folder, "secret_final.png")
-                
-                res = embed_data(self.file_path, output_path, msg, password)
-                
-                if res == "Success":
-                    messagebox.showinfo("Success", f"Stego-image created successfully:\n{output_path}")
-                else:
-                    messagebox.showerror("Error", res)
+            if msg is not None:
+                res = embed_data(self.file_path, out, msg, pwd, map_path)
             else:
-                res = extract_data(self.file_path, password)
-                
-                self.txt_res.config(state="normal")
-                self.txt_res.delete("1.0", tk.END)
-                self.txt_res.insert("1.0", str(res))
-                self.txt_res.config(state="disabled")
+                res = extract_data(self.file_path, pwd)
         except Exception as e:
-            messagebox.showerror("Critical Error", str(e))
+            res = f"ERROR: {e}"
+        # Tkinter thread-safe değildir → sonucu ana thread'e gönder
+        self.root.after(0, self.show_result, res, msg is not None)
+
+    def show_result(self, res, encoding):
+        self.btn.config(state="normal")
+        self.lbl_status.config(text="")
+        if encoding:
+            if res.startswith("Success"):
+                messagebox.showinfo("Success", res)
+            else:
+                messagebox.showerror("Error", res)
+        else:
+            self.txt.config(state="normal")
+            self.txt.delete("1.0", tk.END)
+            self.txt.insert("1.0", res)
+            self.txt.config(state="disabled")
+
 
 if __name__ == "__main__":
     root = tk.Tk()
