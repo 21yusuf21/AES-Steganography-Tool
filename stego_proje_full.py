@@ -341,13 +341,66 @@ def psnr(a, b):
 # ==========================================
 # 7) GUI
 # ==========================================
+METER_COLORS = {"ok": "#2e7d32", "warn": "#f9a825", "over": "#c62828"}
+
+
+def message_bytes(text):
+    """Mesajın UTF-8 bayt sayısı (Türkçe harfler 2 bayt). run() ile aynı şekilde strip edilir."""
+    return len(text.strip().encode("utf-8"))
+
+
+def capacity_level(used, cap):
+    """'ok' (<%80), 'warn' (%80-100), 'over' (sığmıyor)."""
+    if used > cap:
+        return "over"
+    return "warn" if cap and used / cap >= 0.8 else "ok"
+
+
+class CapacityMeter(tk.Frame):
+    """Mesaj yazılırken canlı güncellenen kapasite çubuğu."""
+
+    def __init__(self, master):
+        super().__init__(master, bg="#252526")
+        self.bar = tk.Canvas(self, height=12, bg="#333", highlightthickness=0)
+        self.bar.pack(fill="x")
+        self.label = tk.Label(self, text="", fg="#aaa", bg="#252526", font=("Arial", 9))
+        self.label.pack(anchor="e")
+        self.used = self.cap = None
+        self.bar.bind("<Configure>", lambda e: self._draw())
+
+    def update_meter(self, used, cap):
+        """cap None ise henüz görüntü seçilmemiştir."""
+        self.used, self.cap = used, cap
+        if cap is None:
+            self.label.config(text="Select an image to see its capacity", fg="#aaa")
+        elif used > cap:
+            self.label.config(text=f"{used} / {cap} bytes — {used - cap} bytes over the limit",
+                              fg=METER_COLORS["over"])
+        else:
+            level = capacity_level(used, cap)
+            self.label.config(text=f"{used} / {cap} bytes — {cap - used} left",
+                              fg=METER_COLORS["warn"] if level == "warn" else "#aaa")
+        self._draw()
+
+    def _draw(self):
+        self.bar.delete("all")
+        if self.cap is None:
+            return
+        ratio = min(self.used / self.cap, 1.0) if self.cap else 1.0
+        w, h = self.bar.winfo_width(), self.bar.winfo_height()
+        self.bar.create_rectangle(0, 0, int(w * ratio), h, width=0,
+                                  fill=METER_COLORS[capacity_level(self.used, self.cap)])
+
+
 class StegoApp:
     def __init__(self, root):
         self.root = root
         self.root.title("AES Steganography Tool v2 (Texture-Adaptive)")
-        self.root.geometry("620x580")
+        self.root.geometry("620x620")
         self.root.configure(bg="#1e1e1e")
         self.file_path = None
+        self.capacity = None      # seçili görüntünün kapasitesi (bayt); mod değişince korunur
+        self.busy = False
         self.setup_ui()
 
     def setup_ui(self):
@@ -385,9 +438,15 @@ class StegoApp:
         self.txt = scrolledtext.ScrolledText(self.main_frame, height=6, width=55, bg="#333",
                                              fg="#00ff00", insertbackground="white",
                                              font=("Consolas", 10))
-        self.txt.pack(pady=5)
+        self.txt.pack(pady=(5, 2))
+        self.meter = None
         if not enc:
             self.txt.config(state="disabled")
+        else:
+            self.meter = CapacityMeter(self.main_frame)
+            self.meter.pack(fill="x", pady=(0, 5))
+            # <<Modified>> yazma, yapıştırma, silme... her değişiklikte tetiklenir
+            self.txt.bind("<<Modified>>", self.on_text_change)
         self.show_map = tk.BooleanVar(value=True)
         if enc:
             tk.Checkbutton(self.main_frame, text="Also save block-usage map", variable=self.show_map,
@@ -399,16 +458,35 @@ class StegoApp:
         self.btn.pack(pady=10)
         self.lbl_status = tk.Label(self.main_frame, text="", fg="#aaa", bg="#252526", justify="left")
         self.lbl_status.pack()
+        self.update_capacity()
+
+    # ---------------- kapasite göstergesi ----------------
+    def on_text_change(self, _event=None):
+        self.txt.edit_modified(False)   # bayrağı sıfırla, yoksa olay bir daha tetiklenmez
+        self.update_capacity()
+
+    def update_capacity(self):
+        """Göstergeyi günceller; mesaj sığmıyorsa gizleme butonunu kapatır."""
+        enabled = not self.busy
+        if self.meter is not None:
+            used = message_bytes(self.txt.get("1.0", "end-1c"))
+            self.meter.update_meter(used, self.capacity)
+            if self.capacity is not None and used > self.capacity:
+                enabled = False
+        enc = self.mode.get() == "ENCODE"
+        color = ("#2e7d32" if enc else "#c62828") if enabled else "#3a3a3a"
+        self.btn.config(state="normal" if enabled else "disabled", bg=color)
 
     def select_file(self):
         p = filedialog.askopenfilename(filetypes=[("Image Files", "*.png *.bmp *.jpg *.jpeg *.tif *.tiff")])
         if p:
-            self.file_path = p
-            self.lbl_path.config(text=os.path.basename(p))
             img = read_image_unicode(p)
-            if img is not None and self.mode.get() == "ENCODE":
-                self.lbl_status.config(text=f"{img.shape[1]}x{img.shape[0]} — capacity ≈ "
-                                            f"{capacity_bytes(img)} bytes")
+            if img is None:
+                return messagebox.showerror("Error", f"Could not read image:\n{p}")
+            self.file_path = p
+            self.capacity = capacity_bytes(img)
+            self.lbl_path.config(text=f"{os.path.basename(p)}  ·  {img.shape[1]}x{img.shape[0]}")
+            self.update_capacity()
 
     def run(self):
         pwd = self.ent_pwd.get()
@@ -428,7 +506,8 @@ class StegoApp:
                 map_path = os.path.splitext(out)[0] + "_map.png"
         else:
             msg = None
-        self.btn.config(state="disabled")
+        self.busy = True
+        self.update_capacity()
         self.lbl_status.config(text="Working... (key derivation takes a moment)")
         threading.Thread(target=self.worker, args=(pwd, msg, out, map_path), daemon=True).start()
 
@@ -444,7 +523,8 @@ class StegoApp:
         self.root.after(0, self.show_result, res, msg is not None)
 
     def show_result(self, res, encoding):
-        self.btn.config(state="normal")
+        self.busy = False
+        self.update_capacity()
         self.lbl_status.config(text="")
         if encoding:
             if res.startswith("Success"):
