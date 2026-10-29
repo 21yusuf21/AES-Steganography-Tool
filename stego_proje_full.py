@@ -1,6 +1,13 @@
 """
-Doku-Uyarlamalı (Content-Adaptive) DCT-QIM Steganografi  —  v2
+Doku-Uyarlamalı (Content-Adaptive) DCT-QIM Steganografi  —  v3
 ================================================================
+v3 yenilikleri:
+* Mesaj şifrelenmeden önce sıkıştırılır (raw DEFLATE); yalnızca gerçekten küçülürse.
+* Şifreli verinin içinde 1 baytlık FORMAT BAYTI: sıkıştırma bayrağı + yük türü
+  (ileride dosya gizleme için yer hazır).
+* Nonce artık saklanmıyor; anahtarla birlikte salt'tan türetiliyor → 12 bayt kazanç.
+* Başlığın üst 4 biti format sürümü: v2 ile gizlenmiş görüntüler hâlâ çözülür.
+
 * Veri yalnızca MAVİ (B) kanalın 8x8 DCT bloklarına (2 orta frekans katsayısı) gömülür.
 * "Karışık / dokulu" bölge skoru, HİÇ DEĞİŞTİRİLMEYEN R ve G kanallarından hesaplanır
   → çözücü aynı doku haritasını stego görüntüde yeniden üretebilir.
@@ -15,6 +22,7 @@ Gereksinimler: pip install opencv-python numpy pycryptodome
 
 import os
 import threading
+import zlib
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext
 
@@ -34,11 +42,22 @@ SLOTS_PER_BIT = 3          # Her bit için ayrılan (blok, katsayı) yuvası say
 TEXTURE_PERCENTILE = 50    # Skoru bu yüzdeliğin altındaki bloklara normalde DOKUNULMAZ
 Q_STEP = 24.0              # QIM kuantizasyon adımı (sadece dokulu bloklara uygulanır)
 MIN_MARGIN = 0.6           # Kodlayıcının istediği en düşük ağırlıklı oy farkı
-HEADER_BITS = 32           # Yük uzunluğu (bit) başlığı
+HEADER_BITS = 32           # Başlık: üst 4 bit = format sürümü, alt 28 bit = yük uzunluğu (bit)
+VERSION_SHIFT = 28
+LENGTH_MASK = (1 << VERSION_SHIFT) - 1
+FORMAT_VERSION = 1         # 0 = v2 (eski), 1 = v3 (bu sürüm)
 KDF_ITER = 200_000
-MAP_SALT = b"stego-dct-map-v2"
+MAP_SALT = b"stego-dct-map-v2"   # yuva haritası değişmedi (v2 görüntüleri okunabilsin diye)
 SALT_LEN, NONCE_LEN, TAG_LEN = 16, 12, 16
-OVERHEAD = SALT_LEN + NONCE_LEN + TAG_LEN
+OVERHEAD_V2 = SALT_LEN + NONCE_LEN + TAG_LEN     # 44: salt | nonce | tag | ct
+OVERHEAD = SALT_LEN + TAG_LEN                    # 32: salt | tag | ct   (nonce türetiliyor)
+
+# Format baytı (şifreli verinin İLK baytı, yani dışarıdan görünmez)
+#   bit 0     : 1 = gövde DEFLATE ile sıkıştırılmış
+#   bit 4..7  : yük türü (0 = UTF-8 metin; ileride 1 = dosya)
+FLAG_COMPRESSED = 0x01
+TYPE_TEXT = 0
+MAX_PAYLOAD = 64 * 1024 * 1024   # açılan veri için üst sınır (sıkıştırma bombasına karşı)
 
 
 # ==========================================
@@ -72,24 +91,92 @@ def _kdf(password, salt, n=32, it=KDF_ITER):
     return PBKDF2(password, salt, dkLen=n, count=it, hmac_hash_module=SHA256)
 
 
-def encrypt_payload(plain_text, password):
-    """Çıktı: salt | nonce | tag | ciphertext"""
-    salt, nonce = get_random_bytes(SALT_LEN), get_random_bytes(NONCE_LEN)
-    cipher = AES.new(_kdf(password, salt), AES.MODE_GCM, nonce=nonce)
-    ct, tag = cipher.encrypt_and_digest(plain_text.encode("utf-8"))
-    return salt + nonce + tag + ct
+def _key_and_nonce(password, salt):
+    """Tek KDF çağrısından 32 bayt anahtar + 12 bayt nonce.
+    Her gizlemede salt rastgele → anahtar her seferinde farklı → aynı (anahtar, nonce)
+    çifti asla tekrar etmez. GCM'in tek güvenlik şartı da budur; nonce'u saklamaya gerek yok."""
+    km = _kdf(password, salt, n=32 + NONCE_LEN)
+    return km[:32], km[32:]
+
+
+def encrypt_payload(data, password):
+    """v3. Girdi: bayt. Çıktı: salt | tag | ciphertext"""
+    salt = get_random_bytes(SALT_LEN)
+    key, nonce = _key_and_nonce(password, salt)
+    ct, tag = AES.new(key, AES.MODE_GCM, nonce=nonce).encrypt_and_digest(data)
+    return salt + tag + ct
 
 
 def decrypt_payload(blob, password):
+    """v3. Başarısızlıkta None (yanlış şifre veya bozuk veri)."""
     if len(blob) < OVERHEAD:
         return None
+    salt, tag, ct = blob[:SALT_LEN], blob[SALT_LEN:OVERHEAD], blob[OVERHEAD:]
+    key, nonce = _key_and_nonce(password, salt)
+    try:
+        return AES.new(key, AES.MODE_GCM, nonce=nonce).decrypt_and_verify(ct, tag)
+    except ValueError:
+        return None
+
+
+def decrypt_payload_v2(blob, password):
+    """Eski (v2) format: salt | nonce | tag | ciphertext, düz UTF-8 metin."""
+    if len(blob) < OVERHEAD_V2:
+        return None
     salt, nonce = blob[:SALT_LEN], blob[SALT_LEN:SALT_LEN + NONCE_LEN]
-    tag, ct = blob[SALT_LEN + NONCE_LEN:OVERHEAD], blob[OVERHEAD:]
+    tag, ct = blob[SALT_LEN + NONCE_LEN:OVERHEAD_V2], blob[OVERHEAD_V2:]
     try:
         cipher = AES.new(_kdf(password, salt), AES.MODE_GCM, nonce=nonce)
         return cipher.decrypt_and_verify(ct, tag).decode("utf-8")
     except (ValueError, UnicodeDecodeError):
         return None
+
+
+# ==========================================
+# 2b) YÜK (PAYLOAD): format baytı + isteğe bağlı sıkıştırma
+# ==========================================
+def _deflate(data):
+    # Raw DEFLATE (wbits=-15): zlib'in 2 baytlık başlığı ve 4 baytlık checksum'ı yok.
+    # Bütünlüğü zaten AES-GCM doğruluyor.
+    c = zlib.compressobj(9, zlib.DEFLATED, -15)
+    return c.compress(data) + c.flush()
+
+
+def pack_text(text):
+    """Metin → format baytı + gövde. Sıkıştırma yalnızca gerçekten küçültürse kullanılır."""
+    raw = text.encode("utf-8")
+    packed = _deflate(raw)
+    if len(packed) < len(raw):
+        return bytes([TYPE_TEXT << 4 | FLAG_COMPRESSED]) + packed
+    return bytes([TYPE_TEXT << 4]) + raw
+
+
+def unpack_payload(data):
+    """Format baytı + gövde → metin. Tanınmayan biçimde None."""
+    if not data:
+        return None
+    flags, body = data[0], data[1:]
+    if flags >> 4 != TYPE_TEXT or flags & 0x0E:     # bilinmeyen tür / ayrılmış bitler
+        return None
+    if flags & FLAG_COMPRESSED:
+        d = zlib.decompressobj(-15)
+        try:
+            body = d.decompress(body, MAX_PAYLOAD)
+        except zlib.error:
+            return None
+        if d.unconsumed_tail:                        # sınırı aştı
+            return None
+    try:
+        return body.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def message_bytes(text):
+    """Mesajın görüntüde kaplayacağı bayt (format baytı + gerekirse sıkıştırılmış gövde).
+    Kapasite göstergesi bunu capacity_bytes() ile karşılaştırır. run() ile aynı şekilde strip edilir."""
+    text = text.strip()
+    return len(pack_text(text)) if text else 0
 
 
 # ==========================================
@@ -211,23 +298,30 @@ def _write_block(chan, b, bw, targets, q):
 # ==========================================
 # 5) ENCODER / DECODER
 # ==========================================
-def capacity_bytes(img):
+def raw_capacity_bytes(img):
+    """Görüntüye sığan ham bayt (şifreleme ek yükü dahil)."""
     n_slots = (img.shape[0] // BLOCK) * (img.shape[1] // BLOCK) * len(COEFS)
     raw_bits = (n_slots // SLOTS_PER_BIT) * 4 // 7 - HEADER_BITS
-    return max(0, raw_bits // 8 - OVERHEAD)
+    return max(0, raw_bits // 8)
 
 
-def embed_bytes(img, blob, password):
+def capacity_bytes(img):
+    """Yük (format baytı + mesaj) için kalan bayt. message_bytes() ile karşılaştırılır."""
+    return max(0, raw_capacity_bytes(img) - OVERHEAD)
+
+
+def embed_bytes(img, blob, password, version=FORMAT_VERSION):
     """Bellekte gömme. (stego, kullanılan_bloklar, istatistik) döndürür."""
     bits = np.unpackbits(np.frombuffer(blob, np.uint8))
-    header = np.array([int(c) for c in format(bits.size, f"0{HEADER_BITS}b")], np.uint8)
+    header_val = (version << VERSION_SHIFT) | bits.size
+    header = np.array([int(c) for c in format(header_val, f"0{HEADER_BITS}b")], np.uint8)
     all_bits = hamming_encode(np.concatenate([header, bits]))
 
     score, bw = block_texture(img)
     T, w, q = texture_params(score)
     slots = slot_map(score.size, password)
     if all_bits.size * SLOTS_PER_BIT > slots.size:
-        raise ValueError(f"Message is too long! Capacity ≈ {capacity_bytes(img)} bytes of text.")
+        raise ValueError(f"Message is too long! Capacity is {capacity_bytes(img)} bytes.")
 
     stego = img.copy()
     chan = stego[:, :, 0]                          # B kanalı
@@ -265,6 +359,7 @@ def embed_bytes(img, blob, password):
 
 
 def extract_bytes(img, password):
+    """(format_sürümü, gömülü_baytlar) döndürür; geçerli başlık yoksa (None, None)."""
     score, bw = block_texture(img)      # R,G değişmediği için aynı (veya çok yakın) harita
     _, w, q = texture_params(score)
     slots = slot_map(score.size, password)
@@ -275,32 +370,46 @@ def extract_bytes(img, password):
 
     hc = coded_len(HEADER_BITS)                       # başlık 4'ün katı → kendi kod sözcükleri
     header = hamming_decode(np.array([bit_at(i) for i in range(hc)], np.uint8))
-    L = int("".join(map(str, header)), 2)
+    header_val = int("".join(map(str, header)), 2)
+    version, L = header_val >> VERSION_SHIFT, header_val & LENGTH_MASK
+    min_bytes = {0: OVERHEAD_V2, 1: OVERHEAD + 1}.get(version)   # v2 / v3
     total = coded_len(HEADER_BITS + L)
-    if L < OVERHEAD * 8 or L % 8 or total * SLOTS_PER_BIT > slots.size:
-        return None
+    if min_bytes is None or L < min_bytes * 8 or L % 8 or total * SLOTS_PER_BIT > slots.size:
+        return None, None
     code = np.array([bit_at(i) for i in range(total)], np.uint8)
     bits = hamming_decode(code)[HEADER_BITS:HEADER_BITS + L]
-    return np.packbits(bits).tobytes()
+    return version, np.packbits(bits).tobytes()
+
+
+def decode_blob(version, blob, password):
+    """Sürüme göre şifreyi çöz ve metni döndür; başarısızlıkta None."""
+    if version == 0:
+        return decrypt_payload_v2(blob, password)
+    data = decrypt_payload(blob, password)
+    return None if data is None else unpack_payload(data)
 
 
 def embed_data(image_path, output_path, secret_text, password, map_path=None):
     img = read_image_unicode(image_path)
     if img is None:
         return f"ERROR: Could not read image!\nPath: {image_path}"
+    payload = pack_text(secret_text)
     try:
-        stego, used, st = embed_bytes(img, encrypt_payload(secret_text, password), password)
+        stego, used, st = embed_bytes(img, encrypt_payload(payload, password), password)
     except ValueError as e:
         return f"ERROR: {e}"
 
-    ok = extract_bytes(stego, password) is not None and \
-        decrypt_payload(extract_bytes(stego, password), password) == secret_text
+    version, blob = extract_bytes(stego, password)
+    ok = blob is not None and decode_blob(version, blob, password) == secret_text
     if not save_image_unicode(output_path, stego):
         return f"ERROR: Could not save image!\nPath: {output_path}"
     if map_path:
         _, bw = block_texture(img)
         save_usage_map(img, used, bw, map_path)
-    return (f"Success\nModified blocks: {st['used']}/{st['total']} "
+    raw_len = len(secret_text.encode("utf-8"))
+    comp = (f" (compressed from {raw_len + 1})" if payload[0] & FLAG_COMPRESSED else "")
+    return (f"Success\nPayload: {len(payload)}/{capacity_bytes(img)} bytes{comp}\n"
+            f"Modified blocks: {st['used']}/{st['total']} "
             f"(%{100 * st['used'] / st['total']:.1f}); low-texture blocks touched: {st['forced_flat']}\n"
             f"Self-check: {'OK' if ok else 'FAILED'}")
 
@@ -309,10 +418,10 @@ def extract_data(image_path, password):
     img = read_image_unicode(image_path)
     if img is None:
         return f"ERROR: Could not read image!\nPath: {image_path}"
-    blob = extract_bytes(img, password)
+    version, blob = extract_bytes(img, password)
     if blob is None:
         return "ERROR: Wrong password or no hidden data in this image."
-    result = decrypt_payload(blob, password)
+    result = decode_blob(version, blob, password)
     if result is None:
         return "ERROR: Authentication failed (wrong password or corrupted image)."
     return result
@@ -344,11 +453,6 @@ def psnr(a, b):
 METER_COLORS = {"ok": "#2e7d32", "warn": "#f9a825", "over": "#c62828"}
 
 
-def message_bytes(text):
-    """Mesajın UTF-8 bayt sayısı (Türkçe harfler 2 bayt). run() ile aynı şekilde strip edilir."""
-    return len(text.strip().encode("utf-8"))
-
-
 def capacity_level(used, cap):
     """'ok' (<%80), 'warn' (%80-100), 'over' (sığmıyor)."""
     if used > cap:
@@ -368,17 +472,18 @@ class CapacityMeter(tk.Frame):
         self.used = self.cap = None
         self.bar.bind("<Configure>", lambda e: self._draw())
 
-    def update_meter(self, used, cap):
+    def update_meter(self, used, cap, compressed=False):
         """cap None ise henüz görüntü seçilmemiştir."""
         self.used, self.cap = used, cap
+        note = "  (compressed)" if compressed else ""
         if cap is None:
             self.label.config(text="Select an image to see its capacity", fg="#aaa")
         elif used > cap:
-            self.label.config(text=f"{used} / {cap} bytes — {used - cap} bytes over the limit",
+            self.label.config(text=f"{used} / {cap} bytes{note} — {used - cap} bytes over the limit",
                               fg=METER_COLORS["over"])
         else:
             level = capacity_level(used, cap)
-            self.label.config(text=f"{used} / {cap} bytes — {cap - used} left",
+            self.label.config(text=f"{used} / {cap} bytes{note} — {cap - used} left",
                               fg=METER_COLORS["warn"] if level == "warn" else "#aaa")
         self._draw()
 
@@ -395,7 +500,7 @@ class CapacityMeter(tk.Frame):
 class StegoApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("AES Steganography Tool v2 (Texture-Adaptive)")
+        self.root.title("AES Steganography Tool v3 (Texture-Adaptive)")
         self.root.geometry("620x620")
         self.root.configure(bg="#1e1e1e")
         self.file_path = None
@@ -404,7 +509,7 @@ class StegoApp:
         self.setup_ui()
 
     def setup_ui(self):
-        tk.Label(self.root, text="AES Crypto-Stego Station v2", fg="#00ff00", bg="#1e1e1e",
+        tk.Label(self.root, text="AES Crypto-Stego Station v3", fg="#00ff00", bg="#1e1e1e",
                  font=("Courier", 18, "bold")).pack(pady=15)
         self.mode = tk.StringVar(value="ENCODE")
         tf = tk.Frame(self.root, bg="#1e1e1e"); tf.pack(pady=5)
@@ -469,8 +574,10 @@ class StegoApp:
         """Göstergeyi günceller; mesaj sığmıyorsa gizleme butonunu kapatır."""
         enabled = not self.busy
         if self.meter is not None:
-            used = message_bytes(self.txt.get("1.0", "end-1c"))
-            self.meter.update_meter(used, self.capacity)
+            text = self.txt.get("1.0", "end-1c").strip()
+            used = message_bytes(text)
+            compressed = bool(text) and bool(pack_text(text)[0] & FLAG_COMPRESSED)
+            self.meter.update_meter(used, self.capacity, compressed)
             if self.capacity is not None and used > self.capacity:
                 enabled = False
         enc = self.mode.get() == "ENCODE"
