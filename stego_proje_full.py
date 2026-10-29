@@ -1,22 +1,36 @@
 """
-Doku-Uyarlamalı (Content-Adaptive) DCT-QIM Steganografi  —  v3
-================================================================
+Doku-Uyarlamalı (Content-Adaptive) DCT-QIM Steganografi  —  v4 (inkâr edilebilir)
+==================================================================================
 * Veri yalnızca MAVİ (B) kanalın 8x8 DCT bloklarına (2 orta frekans katsayısı) gömülür.
 * "Karışık / dokulu" bölge skoru, HİÇ DEĞİŞTİRİLMEYEN R ve G kanallarından hesaplanır
   → çözücü aynı doku haritasını stego görüntüde yeniden üretebilir.
-* Bit → yuva eşlemesi şifreden türetilen SABİT bir haritadır (doku seçimi buna karışmaz).
-  Kodlayıcı her bitin yuvalarından yalnızca dokulu olanlara gömer, düz bloklara dokunmaz.
+* Kodlayıcı her bitin yuvalarından yalnızca dokulu olanlara gömer, düz bloklara dokunmaz.
   Çözücü doku ağırlıklı yumuşak oylama yapar: düz blokların oyu ≈ 0.
-  Böylece doku skoru biraz değişse bile (gürültü vb.) senkronizasyon kaybolmaz.
-* Anahtar türetme: Argon2id (bellek-zor; GPU ile kaba kuvveti çok pahalılaştırır).
-* Şifreleme: AES-256-GCM (kimlik doğrulamalı). Nonce saklanmaz, anahtarla birlikte türetilir.
+
+İnkâr edilebilir kasa yapısı
+----------------------------
+Görüntünün TÜM kapasitesi tek bir "konteyner" olarak yazılır:
+
+    [ global salt 16 B ][ 4 hücrelik tablo 4 x 24 B ][ veri alanı ......................... ]
+
+* Her görüntüde HER ZAMAN 4 hücre vardır. 1-4 mesaj, her biri kendi şifresiyle gizlenir.
+* Bir şifrenin hücresi, AES-GCM ile şifrelenmiş (konum, uzunluk) bilgisidir.
+  Mesajın kendisi veri alanında, aynı anahtarla şifreli durur.
+* Kullanılmayan hücreler ve veri alanının boş kalan kısmı RASTGELE baytlarla doldurulur.
+  Şifreli veri rastgeleden ayırt edilemez → kaç mesaj olduğu anlaşılamaz.
+* Çözücü girilen şifreyle 4 hücreyi de dener; yalnızca o şifrenin mesajı açılır.
+
+* Anahtar türetme: Argon2id (bellek-zor). Şifre başına tek çağrı, global salt ile.
 * Mesaj şifrelenmeden önce sıkıştırılır (raw DEFLATE), yalnızca gerçekten küçülürse.
-  Şifreli verinin ilk baytı FORMAT BAYTI: sıkıştırma bayrağı + yük türü.
+  Şifreli mesajın ilk baytı FORMAT BAYTI: sıkıştırma bayrağı + yük türü.
 
 Gereksinimler: pip install opencv-python numpy pycryptodome argon2-cffi
 """
 
+import hashlib
 import os
+import secrets
+import struct
 import threading
 import zlib
 import tkinter as tk
@@ -26,7 +40,6 @@ import cv2
 import numpy as np
 from argon2.low_level import Type, hash_secret_raw
 from Crypto.Cipher import AES
-from Crypto.Random import get_random_bytes
 
 # ==========================================
 # AYARLAR
@@ -35,19 +48,24 @@ BLOCK = 8
 COEFS = [(4, 1), (1, 4)]   # Blok başına kullanılan orta frekans katsayıları (satır, sütun)
 SLOTS_PER_BIT = 3          # Her bit için ayrılan (blok, katsayı) yuvası sayısı
 TEXTURE_PERCENTILE = 50    # Skoru bu yüzdeliğin altındaki bloklara normalde DOKUNULMAZ
-Q_STEP = 24.0              # QIM kuantizasyon adımı (sadece dokulu bloklara uygulanır)
+Q_STEP = 24.0              # QIM kuantizasyon adımı
 MIN_MARGIN = 0.6           # Kodlayıcının istediği en düşük ağırlıklı oy farkı
-HEADER_BITS = 32           # Yük uzunluğu (bit) başlığı
+MAP_SEED = b"stego-dct-map-v4"   # Yuva sırası artık şifreden bağımsız (tüm kasalar paylaşır)
 
 # Argon2id parametreleri (RFC 9106'nın düşük bellekli önerisi: t=3, m=64 MiB, p=4)
-ARGON2_TIME = 3            # geçiş sayısı
+ARGON2_TIME = 3
 ARGON2_MEMORY_KIB = 64 * 1024
 ARGON2_LANES = 4
-MAP_SALT = b"stego-dct-map-v3"
-SALT_LEN, NONCE_LEN, TAG_LEN = 16, 12, 16
-OVERHEAD = SALT_LEN + TAG_LEN    # 32 bayt: salt | tag | ct   (nonce türetiliyor)
 
-# Format baytı (şifreli verinin İLK baytı, yani dışarıdan görünmez)
+# Konteyner düzeni
+N_LOCKERS = 4                         # her görüntüde sabit kasa sayısı (DEĞİŞTİRME: bilgi sızdırır)
+SALT_LEN, NONCE_LEN, TAG_LEN, KEY_LEN = 16, 12, 16, 32
+CELL_PLAIN = 8                        # hücre içeriği: konum (4 B) + uzunluk (4 B)
+CELL_LEN = CELL_PLAIN + TAG_LEN       # 24 B
+TABLE_START = SALT_LEN
+DATA_START = TABLE_START + N_LOCKERS * CELL_LEN   # 112 B
+
+# Format baytı (şifreli mesajın İLK baytı)
 #   bit 0     : 1 = gövde DEFLATE ile sıkıştırılmış
 #   bit 4..7  : yük türü (0 = UTF-8 metin; ileride 1 = dosya)
 FLAG_COMPRESSED = 0x01
@@ -82,37 +100,30 @@ def save_image_unicode(path, img):
 # ==========================================
 # 2) KRİPTO  (Argon2id + AES-256-GCM)
 # ==========================================
-def _kdf(password, salt, n=32):
+def _kdf(password, salt, n):
     """Argon2id. Her tahmin için 64 MiB bellek ister → GPU/ASIC ile toplu deneme pahalı."""
     return hash_secret_raw(password.encode("utf-8"), salt, time_cost=ARGON2_TIME,
                            memory_cost=ARGON2_MEMORY_KIB, parallelism=ARGON2_LANES,
                            hash_len=n, type=Type.ID)
 
 
-def _key_and_nonce(password, salt):
-    """Tek KDF çağrısından 32 bayt anahtar + 12 bayt nonce.
-    Her gizlemede salt rastgele → anahtar her seferinde farklı → aynı (anahtar, nonce)
-    çifti asla tekrar etmez. GCM'in tek güvenlik şartı da budur; nonce'u saklamaya gerek yok."""
-    km = _kdf(password, salt, n=32 + NONCE_LEN)
-    return km[:32], km[32:]
+def derive_keys(password, global_salt):
+    """Tek Argon2 çağrısından: anahtar + hücre nonce'u + mesaj nonce'u.
+    Global salt her görüntüde rastgele → anahtar görüntüye özgü; aynı anahtarla yapılan
+    iki şifreleme farklı nonce kullanır. Nonce'ları saklamaya gerek yok."""
+    km = _kdf(password, global_salt, KEY_LEN + 2 * NONCE_LEN)
+    return km[:KEY_LEN], km[KEY_LEN:KEY_LEN + NONCE_LEN], km[KEY_LEN + NONCE_LEN:]
 
 
-def encrypt_payload(data, password):
-    """Girdi: bayt. Çıktı: salt | tag | ciphertext"""
-    salt = get_random_bytes(SALT_LEN)
-    key, nonce = _key_and_nonce(password, salt)
+def _seal(key, nonce, data):
     ct, tag = AES.new(key, AES.MODE_GCM, nonce=nonce).encrypt_and_digest(data)
-    return salt + tag + ct
+    return tag + ct
 
 
-def decrypt_payload(blob, password):
-    """Başarısızlıkta None (yanlış şifre veya bozuk veri)."""
-    if len(blob) < OVERHEAD:
-        return None
-    salt, tag, ct = blob[:SALT_LEN], blob[SALT_LEN:OVERHEAD], blob[OVERHEAD:]
-    key, nonce = _key_and_nonce(password, salt)
+def _open(key, nonce, sealed):
     try:
-        return AES.new(key, AES.MODE_GCM, nonce=nonce).decrypt_and_verify(ct, tag)
+        return AES.new(key, AES.MODE_GCM, nonce=nonce).decrypt_and_verify(sealed[TAG_LEN:],
+                                                                          sealed[:TAG_LEN])
     except ValueError:
         return None
 
@@ -157,15 +168,68 @@ def unpack_payload(data):
         return None
 
 
-def message_bytes(text):
-    """Mesajın görüntüde kaplayacağı bayt (format baytı + gerekirse sıkıştırılmış gövde).
-    Kapasite göstergesi bunu capacity_bytes() ile karşılaştırır. run() ile aynı şekilde strip edilir."""
+def message_cost(text):
+    """Bir mesajın veri alanında kapladığı bayt: doğrulama etiketi + format baytı + gövde.
+    Boş mesaj kasa kullanmaz → 0. run() ile aynı şekilde strip edilir."""
     text = text.strip()
-    return len(pack_text(text)) if text else 0
+    return TAG_LEN + len(pack_text(text)) if text else 0
 
 
 # ==========================================
-# 3) DOKU HARİTASI
+# 3) KONTEYNER (inkâr edilebilir kasalar)
+# ==========================================
+def build_container(size, messages):
+    """
+    messages: [(metin, şifre), ...]  (1..N_LOCKERS adet)
+    Dönen: tam olarak `size` baytlık konteyner. Kullanılmayan her yer rastgele.
+    """
+    if not 1 <= len(messages) <= N_LOCKERS:
+        raise ValueError(f"Between 1 and {N_LOCKERS} messages are supported.")
+    pwds = [p for _, p in messages]
+    if any(not p for p in pwds):
+        raise ValueError("Every message needs a password.")
+    if len(set(pwds)) != len(pwds):
+        raise ValueError("Each message must have a different password.")
+    need = DATA_START + sum(message_cost(t) for t, _ in messages)
+    if need > size:
+        raise ValueError(f"Messages are too long: {need - DATA_START} bytes needed, "
+                         f"capacity is {max(0, size - DATA_START)} bytes.")
+
+    box = bytearray(secrets.token_bytes(size))     # her şey önce rastgele
+    gsalt = bytes(box[:SALT_LEN])                   # global salt da rastgele baytların parçası
+    cells = secrets.SystemRandom().sample(range(N_LOCKERS), len(messages))  # hangi hücre: rastgele
+    pos = DATA_START
+    for (text, pwd), cell in zip(messages, cells):
+        key, n_cell, n_msg = derive_keys(pwd, gsalt)
+        body = _seal(key, n_msg, pack_text(text.strip()))
+        box[pos:pos + len(body)] = body
+        entry = _seal(key, n_cell, struct.pack(">II", pos, len(body)))
+        c0 = TABLE_START + cell * CELL_LEN
+        box[c0:c0 + CELL_LEN] = entry
+        pos += len(body)
+    return bytes(box)
+
+
+def open_container(box, password):
+    """Şifrenin kasasındaki metni döndürür; bu şifreye ait kasa yoksa None."""
+    if len(box) < DATA_START:
+        return None
+    key, n_cell, n_msg = derive_keys(password, box[:SALT_LEN])
+    for cell in range(N_LOCKERS):
+        c0 = TABLE_START + cell * CELL_LEN
+        entry = _open(key, n_cell, box[c0:c0 + CELL_LEN])
+        if entry is None:
+            continue
+        pos, length = struct.unpack(">II", entry)
+        if pos < DATA_START or length < TAG_LEN + 1 or pos + length > len(box):
+            return None
+        data = _open(key, n_msg, box[pos:pos + length])
+        return None if data is None else unpack_payload(data)
+    return None
+
+
+# ==========================================
+# 4) DOKU HARİTASI
 # ==========================================
 def block_texture(img):
     """
@@ -197,20 +261,19 @@ def texture_params(score):
     return T, w, q
 
 
-def slot_map(n_blocks, password):
+def slot_map(n_blocks):
     """
-    Şifreden türetilmiş SABİT yuva haritası: (blok, katsayı) çiftlerinin karışık sırası.
-    Doku haritasından bağımsız olduğu için gürültü vs. senkronizasyonu bozamaz.
+    SABİT yuva sırası: (blok, katsayı) çiftlerinin karışık sırası. Şifreden bağımsızdır,
+    çünkü 4 kasa aynı konteyneri paylaşır. Bitleri görüntüye yaymak (gürültüye karşı) için var.
     """
-    seed = _kdf(password, MAP_SALT, n=16)
-    rng = np.random.default_rng(int.from_bytes(seed, "big"))
+    seed = int.from_bytes(hashlib.sha256(MAP_SEED).digest()[:16], "big")
     slots = np.arange(n_blocks * len(COEFS))
-    rng.shuffle(slots)
+    np.random.default_rng(seed).shuffle(slots)
     return slots   # slot -> blok = s // len(COEFS), katsayı = COEFS[s % len(COEFS)]
 
 
 # ==========================================
-# 3b) HATA DÜZELTME: Hamming(7,4)  — her 7 bitlik kod sözcüğünde 1 hatayı düzeltir
+# 4b) HATA DÜZELTME: Hamming(7,4)  — her 7 bitlik kod sözcüğünde 1 hatayı düzeltir
 # ==========================================
 _G = np.array([[1,1,0,1],[1,0,1,1],[1,0,0,0],[0,1,1,1],[0,1,0,0],[0,0,1,0],[0,0,0,1]], np.uint8)
 _H = np.array([[1,0,1,0,1,0,1],[0,1,1,0,0,1,1],[0,0,0,1,1,1,1]], np.uint8)
@@ -235,8 +298,13 @@ def coded_len(n_bits):
 
 
 # ==========================================
-# 4) QIM
+# 5) QIM
 # ==========================================
+# 8x8 ortonormal DCT-II matrisi (cv2.dct ile aynı): katsayı[u,v] = C[u] @ blok @ C[v]
+_C = np.array([[np.sqrt((1 if k == 0 else 2) / BLOCK) * np.cos(np.pi * (2 * n + 1) * k / (2 * BLOCK))
+                for n in range(BLOCK)] for k in range(BLOCK)])
+
+
 def _qim_embed(c, bit, q):
     if bit == 0:
         return np.round(c / q) * q
@@ -244,29 +312,23 @@ def _qim_embed(c, bit, q):
 
 
 def _qim_detect(c, q):
-    d0 = abs(c - np.round(c / q) * q)
-    d1 = abs(c - (np.round((c - q / 2) / q) * q + q / 2))
-    return 1 if d1 < d0 else 0
+    """Vektörel: c ve q aynı şekilli diziler olabilir."""
+    d0 = np.abs(c - np.round(c / q) * q)
+    d1 = np.abs(c - (np.round((c - q / 2) / q) * q + q / 2))
+    return (d1 < d0).astype(np.uint8)
 
 
 def _block_xy(b, bw):
     return (b // bw) * BLOCK, (b % bw) * BLOCK
 
 
-def _detect_slot(chan, s, bw, q):
-    b, k = divmod(int(s), len(COEFS))
-    y, x = _block_xy(b, bw)
-    u, v = COEFS[k]
-    return _qim_detect(cv2.dct(chan[y:y + BLOCK, x:x + BLOCK].astype(np.float32))[u, v], q[b])
-
-
-def _read_bit(chan, row, bw, w, q):
-    """Doku ağırlıklı yumuşak oylama. Düz (dokunulmamış) blokların oyu neredeyse sıfır."""
-    acc = 0.0
-    for s in row:
-        b = int(s) // len(COEFS)
-        acc += w[b] * (1 if _detect_slot(chan, s, bw, q) else -1)
-    return 1 if acc > 0 else 0
+def _all_coeffs(chan):
+    """Tüm bloklar için kullanılan DCT katsayıları → (blok sayısı, len(COEFS)). Tek seferde, hızlı."""
+    h, w = chan.shape
+    bh, bw = h // BLOCK, w // BLOCK
+    X = chan[:bh * BLOCK, :bw * BLOCK].astype(np.float64)
+    X = X.reshape(bh, BLOCK, bw, BLOCK).swapaxes(1, 2).reshape(-1, BLOCK, BLOCK)
+    return np.stack([np.einsum("i,nij,j->n", _C[u], X, _C[v]) for u, v in COEFS], axis=1)
 
 
 def _write_block(chan, b, bw, targets, q):
@@ -276,139 +338,133 @@ def _write_block(chan, b, bw, targets, q):
     for k, bit in targets.items():
         u, v = COEFS[k]
         d[u, v] = _qim_embed(d[u, v], bit, q)
-    out = np.clip(np.round(cv2.idct(d)), 0, 255)   # ← orijinal kodda eksikti (taşma hatası)
+    out = np.clip(np.round(cv2.idct(d)), 0, 255)
     chan[y:y + BLOCK, x:x + BLOCK] = out.astype(np.uint8)
 
 
 # ==========================================
-# 5) ENCODER / DECODER
+# 6) GÖMME / ÇIKARMA  (konteyner baytları ↔ görüntü)
 # ==========================================
-def raw_capacity_bytes(img):
-    """Görüntüye sığan ham bayt (şifreleme ek yükü dahil)."""
+def container_size(img):
+    """Görüntüye sığan konteyner boyutu (bayt). Her gizlemede konteyner TAMAMEN yazılır."""
     n_slots = (img.shape[0] // BLOCK) * (img.shape[1] // BLOCK) * len(COEFS)
-    raw_bits = (n_slots // SLOTS_PER_BIT) * 4 // 7 - HEADER_BITS
-    return max(0, raw_bits // 8)
+    return (n_slots // SLOTS_PER_BIT) // 7 * 4 // 8
 
 
 def capacity_bytes(img):
-    """Yük (format baytı + mesaj) için kalan bayt. message_bytes() ile karşılaştırılır."""
-    return max(0, raw_capacity_bytes(img) - OVERHEAD)
+    """Mesajlar için kalan bayt (salt + 4 hücrelik tablo düşülmüş). message_cost() toplamıyla karşılaştırılır."""
+    return max(0, container_size(img) - DATA_START)
 
 
-def embed_bytes(img, blob, password):
-    """Bellekte gömme. (stego, kullanılan_bloklar, istatistik) döndürür."""
-    bits = np.unpackbits(np.frombuffer(blob, np.uint8))
-    header = np.array([int(c) for c in format(bits.size, f"0{HEADER_BITS}b")], np.uint8)
-    all_bits = hamming_encode(np.concatenate([header, bits]))
-
+def embed_bytes(img, data):
+    """Konteyneri görüntüye göm. (stego, kullanılan_bloklar, istatistik) döndürür."""
     score, bw = block_texture(img)
     T, w, q = texture_params(score)
-    slots = slot_map(score.size, password)
-    if all_bits.size * SLOTS_PER_BIT > slots.size:
-        raise ValueError(f"Message is too long! Capacity is {capacity_bytes(img)} bytes.")
+    slots = slot_map(score.size)
+    bits = hamming_encode(np.unpackbits(np.frombuffer(data, np.uint8)))
+    if bits.size * SLOTS_PER_BIT > slots.size:
+        raise ValueError("Container does not fit in this image.")
+
+    K, nc = SLOTS_PER_BIT, len(COEFS)
+    rows = slots[:bits.size * K].reshape(-1, K)
+    blk, kk = rows // nc, rows % nc
+    det_orig = _qim_detect(_all_coeffs(img[:, :, 0])[blk, kk], q[blk])   # dokunulmasa ne okunur
+    wts, sc = w[blk], score[blk]
+    textured = sc >= T
+
+    # 1) Önce yalnızca dokulu yuvalar. Çözücünün ağırlıklı oyunu simüle et.
+    chosen = textured.copy()
+    agree_nat = (det_orig == bits[:, None])
+    tot = wts.sum(1)
+
+    def margin(ch):
+        agree = (wts * (ch | (~ch & agree_nat))).sum(1)
+        return np.where(tot > 0, (2 * agree - tot) / np.maximum(tot, 1e-12), -1)
+
+    # 2) Fark yetersizse kalan yuvaları en dokuludan başlayarak ekle (nadiren düz bloğa dokunur)
+    forced = 0
+    for i in np.where(margin(chosen) < MIN_MARGIN)[0]:
+        for j in np.argsort(-sc[i]):
+            if chosen[i, j]:
+                continue
+            chosen[i, j] = True
+            forced += 1
+            a = (wts[i] * (chosen[i] | (~chosen[i] & agree_nat[i]))).sum()
+            if tot[i] > 0 and (2 * a - tot[i]) / tot[i] >= MIN_MARGIN:
+                break
+
+    plan = {}                                       # blok -> {katsayı: bit}
+    for i, j in zip(*np.nonzero(chosen)):
+        plan.setdefault(int(blk[i, j]), {})[int(kk[i, j])] = int(bits[i])
 
     stego = img.copy()
-    chan = stego[:, :, 0]                          # B kanalı
-    plan = {}                                      # blok -> {katsayı: bit}
-    forced = 0
-    for i, bit in enumerate(all_bits):
-        row = slots[i * SLOTS_PER_BIT:(i + 1) * SLOTS_PER_BIT]
-        blocks = [int(s) // len(COEFS) for s in row]
-        # 1) Dokulu yuvalara göm
-        chosen = [j for j, b in enumerate(blocks) if score[b] >= T]
-        # 2) Kodlayıcı, çözücünün ağırlıklı oyunu simüle eder; fark yetersizse
-        #    kalan yuvaları en dokuludan başlayarak ekler (nadiren düz bloğa dokunur).
-        rest = sorted(set(range(len(row))) - set(chosen), key=lambda j: -score[blocks[j]])
-        while True:
-            tot = sum(w[b] for b in blocks)
-            agree = sum(w[blocks[j]] for j in chosen)
-            for j in rest:                          # dokunulmayan yuvaların doğal oyu
-                if j in chosen:
-                    continue
-                agree += w[blocks[j]] * (1 if _detect_slot(img[:, :, 0], row[j], bw, q) == bit else 0)
-            margin = (2 * agree - tot) / tot if tot > 0 else -1
-            if margin >= MIN_MARGIN or len(chosen) == len(row):
-                break
-            j = next(j for j in rest if j not in chosen)
-            chosen.append(j)
-            forced += score[blocks[j]] < T
-        for j in chosen:
-            b, k = divmod(int(row[j]), len(COEFS))
-            plan.setdefault(b, {})[k] = int(bit)
-
+    chan = stego[:, :, 0]                           # B kanalı
     for b, targets in plan.items():
         _write_block(chan, b, bw, targets, q[b])
 
     return stego, np.array(sorted(plan)), {"used": len(plan), "total": score.size, "forced_flat": forced}
 
 
-def extract_bytes(img, password):
-    """Gömülü baytları döndürür; geçerli bir başlık yoksa None."""
-    score, bw = block_texture(img)      # R,G değişmediği için aynı (veya çok yakın) harita
+def extract_bytes(img):
+    """Görüntüdeki konteyneri okur (şifre gerekmez; içerik şifreli/rastgele)."""
+    score, bw = block_texture(img)
     _, w, q = texture_params(score)
-    slots = slot_map(score.size, password)
-    chan = img[:, :, 0]
-
-    def bit_at(i):
-        return _read_bit(chan, slots[i * SLOTS_PER_BIT:(i + 1) * SLOTS_PER_BIT], bw, w, q)
-
-    hc = coded_len(HEADER_BITS)                       # başlık 4'ün katı → kendi kod sözcükleri
-    header = hamming_decode(np.array([bit_at(i) for i in range(hc)], np.uint8))
-    L = int("".join(map(str, header)), 2)
-    total = coded_len(HEADER_BITS + L)
-    if L < (OVERHEAD + 1) * 8 or L % 8 or total * SLOTS_PER_BIT > slots.size:
-        return None
-    code = np.array([bit_at(i) for i in range(total)], np.uint8)
-    bits = hamming_decode(code)[HEADER_BITS:HEADER_BITS + L]
+    slots = slot_map(score.size)
+    n_bits = coded_len(container_size(img) * 8)
+    K, nc = SLOTS_PER_BIT, len(COEFS)
+    rows = slots[:n_bits * K].reshape(-1, K)
+    blk, kk = rows // nc, rows % nc
+    det = _qim_detect(_all_coeffs(img[:, :, 0])[blk, kk], q[blk])
+    acc = (w[blk] * (2.0 * det - 1)).sum(1)          # doku ağırlıklı yumuşak oylama
+    bits = hamming_decode((acc > 0).astype(np.uint8))[:container_size(img) * 8]
     return np.packbits(bits).tobytes()
 
 
-def decode_blob(blob, password):
-    """Şifreyi çöz ve metni döndür; başarısızlıkta None."""
-    data = decrypt_payload(blob, password)
-    return None if data is None else unpack_payload(data)
-
-
-def embed_data(image_path, output_path, secret_text, password, map_path=None):
+def embed_data(image_path, output_path, messages, map_path=None):
+    """messages: [(metin, şifre), ...] — boş metinler atlanır."""
     img = read_image_unicode(image_path)
     if img is None:
         return f"ERROR: Could not read image!\nPath: {image_path}"
-    payload = pack_text(secret_text)
+    messages = [(t.strip(), p) for t, p in messages if t.strip()]
+    if not messages:
+        return "ERROR: Secret message cannot be empty."
     try:
-        stego, used, st = embed_bytes(img, encrypt_payload(payload, password), password)
+        box = build_container(container_size(img), messages)
+        stego, used, st = embed_bytes(img, box)
     except ValueError as e:
         return f"ERROR: {e}"
 
-    blob = extract_bytes(stego, password)
-    ok = blob is not None and decode_blob(blob, password) == secret_text
+    # Kendi kendini doğrulama: konteyner bayt bayt geri okunabiliyor mu?
+    # (Şifre gerektirmez → ek Argon2 maliyeti yok, üstelik tüm kasaları birden kontrol eder.)
+    ok = extract_bytes(stego) == box
+    if not ok:
+        return "ERROR: Self-check failed, the data could not be read back. Try a different image."
     if not save_image_unicode(output_path, stego):
         return f"ERROR: Could not save image!\nPath: {output_path}"
     if map_path:
         _, bw = block_texture(img)
         save_usage_map(img, used, bw, map_path)
-    raw_len = len(secret_text.encode("utf-8"))
-    comp = (f" (compressed from {raw_len + 1})" if payload[0] & FLAG_COMPRESSED else "")
-    return (f"Success\nPayload: {len(payload)}/{capacity_bytes(img)} bytes{comp}\n"
+    used_b = sum(message_cost(t) for t, _ in messages)
+    return (f"Success\nMessages hidden: {len(messages)} (image always has {N_LOCKERS} lockers)\n"
+            f"Used: {used_b}/{capacity_bytes(img)} bytes, rest filled with random data\n"
             f"Modified blocks: {st['used']}/{st['total']} "
-            f"(%{100 * st['used'] / st['total']:.1f}); low-texture blocks touched: {st['forced_flat']}\n"
-            f"Self-check: {'OK' if ok else 'FAILED'}")
+            f"(%{100 * st['used'] / st['total']:.1f}); low-texture slots touched: {st['forced_flat']}\n"
+            f"Self-check: OK")
 
 
 def extract_data(image_path, password):
     img = read_image_unicode(image_path)
     if img is None:
         return f"ERROR: Could not read image!\nPath: {image_path}"
-    blob = extract_bytes(img, password)
-    if blob is None:
-        return "ERROR: Wrong password or no hidden data in this image."
-    result = decode_blob(blob, password)
+    result = open_container(extract_bytes(img), password)
     if result is None:
-        return "ERROR: Authentication failed (wrong password or corrupted image)."
+        # Bilerek ayrım yapılmıyor: "görüntüde veri yok" ile "yanlış şifre" aynı görünmeli.
+        return "ERROR: No message found for this password."
     return result
 
 
 # ==========================================
-# 6) GÖRSELLEŞTİRME (rapor/sunum için)
+# 7) GÖRSELLEŞTİRME
 # ==========================================
 def save_usage_map(img, used_idx, bw, path):
     """Değiştirilen blokları yeşil ile işaretleyen bindirme görüntüsü."""
@@ -428,9 +484,10 @@ def psnr(a, b):
 
 
 # ==========================================
-# 7) GUI
+# 8) GUI
 # ==========================================
 METER_COLORS = {"ok": "#2e7d32", "warn": "#f9a825", "over": "#c62828"}
+BG, PANEL, FIELD, MUTED = "#1e1e1e", "#252526", "#333", "#aaa"
 
 
 def capacity_level(used, cap):
@@ -441,30 +498,29 @@ def capacity_level(used, cap):
 
 
 class CapacityMeter(tk.Frame):
-    """Mesaj yazılırken canlı güncellenen kapasite çubuğu."""
+    """Mesaj yazılırken canlı güncellenen kapasite çubuğu (tüm kasaların toplamı)."""
 
     def __init__(self, master):
-        super().__init__(master, bg="#252526")
-        self.bar = tk.Canvas(self, height=12, bg="#333", highlightthickness=0)
+        super().__init__(master, bg=PANEL)
+        self.bar = tk.Canvas(self, height=12, bg=FIELD, highlightthickness=0)
         self.bar.pack(fill="x")
-        self.label = tk.Label(self, text="", fg="#aaa", bg="#252526", font=("Arial", 9))
+        self.label = tk.Label(self, text="", fg=MUTED, bg=PANEL, font=("Arial", 9))
         self.label.pack(anchor="e")
         self.used = self.cap = None
         self.bar.bind("<Configure>", lambda e: self._draw())
 
-    def update_meter(self, used, cap, compressed=False):
+    def update_meter(self, used, cap, note=""):
         """cap None ise henüz görüntü seçilmemiştir."""
         self.used, self.cap = used, cap
-        note = "  (compressed)" if compressed else ""
         if cap is None:
-            self.label.config(text="Select an image to see its capacity", fg="#aaa")
+            self.label.config(text="Select an image to see its capacity", fg=MUTED)
         elif used > cap:
-            self.label.config(text=f"{used} / {cap} bytes{note} — {used - cap} bytes over the limit",
+            self.label.config(text=f"All lockers: {used} / {cap} bytes — {used - cap} bytes over the limit",
                               fg=METER_COLORS["over"])
         else:
             level = capacity_level(used, cap)
-            self.label.config(text=f"{used} / {cap} bytes{note} — {cap - used} left",
-                              fg=METER_COLORS["warn"] if level == "warn" else "#aaa")
+            self.label.config(text=f"All lockers: {used} / {cap} bytes — {cap - used} left{note}",
+                              fg=METER_COLORS["warn"] if level == "warn" else MUTED)
         self._draw()
 
     def _draw(self):
@@ -480,89 +536,151 @@ class CapacityMeter(tk.Frame):
 class StegoApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("AES Steganography Tool v3 (Texture-Adaptive)")
-        self.root.geometry("620x620")
-        self.root.configure(bg="#1e1e1e")
+        self.root.title("AES Steganography Tool v4 (Deniable Lockers)")
+        self.root.geometry("640x680")
+        self.root.configure(bg=BG)
         self.file_path = None
         self.capacity = None      # seçili görüntünün kapasitesi (bayt); mod değişince korunur
         self.busy = False
+        self.lockers = [{"pwd": "", "text": ""} for _ in range(N_LOCKERS)]
+        self.cur = 0              # düzenlenen kasa
+        self.locker_btns = []
         self.setup_ui()
 
     def setup_ui(self):
-        tk.Label(self.root, text="AES Crypto-Stego Station v3", fg="#00ff00", bg="#1e1e1e",
+        tk.Label(self.root, text="AES Crypto-Stego Station v4", fg="#00ff00", bg=BG,
                  font=("Courier", 18, "bold")).pack(pady=15)
         self.mode = tk.StringVar(value="ENCODE")
-        tf = tk.Frame(self.root, bg="#1e1e1e"); tf.pack(pady=5)
+        tf = tk.Frame(self.root, bg=BG); tf.pack(pady=5)
         for text, val, col in (("HIDE DATA (ENCODE)", "ENCODE", "#00ff00"),
                                ("REVEAL DATA (DECODE)", "DECODE", "#ff3333")):
-            tk.Radiobutton(tf, text=text, variable=self.mode, value=val, fg=col, bg="#1e1e1e",
-                           selectcolor="#333", activebackground="#1e1e1e", activeforeground=col,
+            tk.Radiobutton(tf, text=text, variable=self.mode, value=val, fg=col, bg=BG,
+                           selectcolor=FIELD, activebackground=BG, activeforeground=col,
                            font=("Arial", 10, "bold"), command=self.refresh).pack(side="left", padx=15)
-        self.main_frame = tk.Frame(self.root, bg="#252526", padx=20, pady=20)
+        self.main_frame = tk.Frame(self.root, bg=PANEL, padx=20, pady=15)
         self.main_frame.pack(expand=True, fill="both", padx=20, pady=10)
         self.refresh()
 
+    @property
+    def encoding(self):
+        return self.mode.get() == "ENCODE"
+
     def refresh(self):
+        if getattr(self, "txt", None) is not None and getattr(self, "_built_encode", False):
+            self.save_locker()                      # mod değişmeden önce düzenlenen kasayı kaydet
         for w in self.main_frame.winfo_children():
             w.destroy()
-        enc = self.mode.get() == "ENCODE"
+        enc = self.encoding
+        self._built_encode = enc
         tk.Button(self.main_frame, text="Select Image (to Hide)" if enc else "Select Image (to Reveal)",
                   command=self.select_file, width=25, bg="#444", fg="white").pack(pady=5)
-        self.lbl_path = tk.Label(self.main_frame, text=os.path.basename(self.file_path) if self.file_path
-                                 else "No file selected", fg="#aaa", bg="#252526",
+        self.lbl_path = tk.Label(self.main_frame, text="", fg=MUTED, bg=PANEL,
                                  font=("Arial", 9, "italic"))
         self.lbl_path.pack()
-        tk.Label(self.main_frame, text="Password:", fg="white", bg="#252526",
-                 font=("Arial", 10, "bold")).pack(pady=(15, 0))
-        self.ent_pwd = tk.Entry(self.main_frame, show="*", width=35, bg="#333", fg="white",
+        self._update_path_label()
+
+        self.locker_btns = []
+        if enc:
+            lf = tk.Frame(self.main_frame, bg=PANEL); lf.pack(pady=(12, 0))
+            tk.Label(lf, text="Locker:", fg="white", bg=PANEL,
+                     font=("Arial", 10, "bold")).pack(side="left", padx=(0, 8))
+            for i in range(N_LOCKERS):
+                b = tk.Button(lf, width=5, command=lambda i=i: self.switch_locker(i),
+                              fg="white", relief="flat", font=("Arial", 9, "bold"))
+                b.pack(side="left", padx=2)
+                self.locker_btns.append(b)
+            tk.Label(self.main_frame, text="Each locker = one message + its own password. "
+                                           "Empty lockers are filled with random data.",
+                     fg=MUTED, bg=PANEL, font=("Arial", 8)).pack()
+
+        tk.Label(self.main_frame, text="Password:", fg="white", bg=PANEL,
+                 font=("Arial", 10, "bold")).pack(pady=(10, 0))
+        self.ent_pwd = tk.Entry(self.main_frame, show="*", width=35, bg=FIELD, fg="white",
                                 insertbackground="white")
         self.ent_pwd.pack(pady=5)
 
         tk.Label(self.main_frame, text="Secret Message:" if enc else "Decoded Message:",
-                 fg="white", bg="#252526", font=("Arial", 10, "bold")).pack(pady=(10, 0))
-        self.txt = scrolledtext.ScrolledText(self.main_frame, height=6, width=55, bg="#333",
+                 fg="white", bg=PANEL, font=("Arial", 10, "bold")).pack(pady=(10, 0))
+        self.txt = scrolledtext.ScrolledText(self.main_frame, height=8, width=58, bg=FIELD,
                                              fg="#00ff00", insertbackground="white",
-                                             font=("Consolas", 10))
-        self.txt.pack(pady=(5, 2))
+                                             font=("Consolas", 10), wrap="word")
+        self.txt.pack(pady=(5, 2), fill="both", expand=True)
         self.meter = None
         if not enc:
             self.txt.config(state="disabled")
         else:
             self.meter = CapacityMeter(self.main_frame)
             self.meter.pack(fill="x", pady=(0, 5))
+            self.load_locker(self.cur)
             # <<Modified>> yazma, yapıştırma, silme... her değişiklikte tetiklenir
-            self.txt.bind("<<Modified>>", self.on_text_change)
-        self.show_map = tk.BooleanVar(value=True)
+            self.txt.bind("<<Modified>>", self.on_change)
+            self.ent_pwd.bind("<KeyRelease>", self.on_change)
+        self.show_map = tk.BooleanVar(value=False)
         if enc:
             tk.Checkbutton(self.main_frame, text="Also save block-usage map", variable=self.show_map,
-                           fg="white", bg="#252526", selectcolor="#333",
-                           activebackground="#252526").pack()
+                           fg="white", bg=PANEL, selectcolor=FIELD,
+                           activebackground=PANEL).pack()
         self.btn = tk.Button(self.main_frame, text="🔒 ENCRYPT & HIDE" if enc else "🔓 DECRYPT & REVEAL",
-                             bg="#2e7d32" if enc else "#c62828", fg="white",
-                             font=("Arial", 11, "bold"), width=20, command=self.run)
+                             fg="white", font=("Arial", 11, "bold"), width=20, command=self.run)
         self.btn.pack(pady=10)
-        self.lbl_status = tk.Label(self.main_frame, text="", fg="#aaa", bg="#252526", justify="left")
+        self.lbl_status = tk.Label(self.main_frame, text="", fg=MUTED, bg=PANEL, justify="left")
         self.lbl_status.pack()
         self.update_capacity()
 
+    # ---------------- kasalar ----------------
+    def save_locker(self):
+        self.lockers[self.cur] = {"pwd": self.ent_pwd.get(), "text": self.txt.get("1.0", "end-1c")}
+
+    def load_locker(self, i):
+        self.cur = i
+        self.ent_pwd.delete(0, tk.END)
+        self.ent_pwd.insert(0, self.lockers[i]["pwd"])
+        self.txt.delete("1.0", tk.END)
+        self.txt.insert("1.0", self.lockers[i]["text"])
+        self.txt.edit_modified(False)
+
+    def switch_locker(self, i):
+        self.save_locker()
+        self.load_locker(i)
+        self.update_capacity()
+
+    def _style_locker_buttons(self):
+        for i, b in enumerate(self.locker_btns):
+            filled = bool(self.lockers[i]["text"].strip())
+            b.config(text=f"{i + 1}{' ●' if filled else ''}",
+                     bg="#2e7d32" if i == self.cur else ("#3d5a40" if filled else "#444"))
+
     # ---------------- kapasite göstergesi ----------------
-    def on_text_change(self, _event=None):
-        self.txt.edit_modified(False)   # bayrağı sıfırla, yoksa olay bir daha tetiklenmez
+    def on_change(self, _event=None):
+        if _event is not None and _event.widget is self.txt:
+            self.txt.edit_modified(False)   # bayrağı sıfırla, yoksa olay bir daha tetiklenmez
         self.update_capacity()
 
     def update_capacity(self):
-        """Göstergeyi günceller; mesaj sığmıyorsa gizleme butonunu kapatır."""
+        """Göstergeyi günceller; mesajlar sığmıyorsa gizleme butonunu kapatır."""
         enabled = not self.busy
         if self.meter is not None:
-            text = self.txt.get("1.0", "end-1c").strip()
-            used = message_bytes(text)
-            compressed = bool(text) and bool(pack_text(text)[0] & FLAG_COMPRESSED)
-            self.meter.update_meter(used, self.capacity, compressed)
+            self.save_locker()
+            used = sum(message_cost(l["text"]) for l in self.lockers)
+            cur = self.lockers[self.cur]["text"].strip()
+            note = f"  ·  locker {self.cur + 1}: {message_cost(cur)} B" if cur else ""
+            if cur and pack_text(cur)[0] & FLAG_COMPRESSED:
+                note += " (compressed)"
+            self.meter.update_meter(used, self.capacity, note)
             if self.capacity is not None and used > self.capacity:
                 enabled = False
-        enc = self.mode.get() == "ENCODE"
-        color = ("#2e7d32" if enc else "#c62828") if enabled else "#3a3a3a"
+            self._style_locker_buttons()
+        color = ("#2e7d32" if self.encoding else "#c62828") if enabled else "#3a3a3a"
         self.btn.config(state="normal" if enabled else "disabled", bg=color)
+
+    def _update_path_label(self):
+        if not self.file_path:
+            self.lbl_path.config(text="No file selected")
+            return
+        info = f"{os.path.basename(self.file_path)}  ·  {self.image_size[0]}x{self.image_size[1]}"
+        if self.encoding:
+            info += f"  ·  capacity {self.capacity} bytes"
+        self.lbl_path.config(text=info)
 
     def select_file(self):
         p = filedialog.askopenfilename(filetypes=[("Image Files", "*.png *.bmp *.jpg *.jpeg *.tif *.tiff")])
@@ -572,18 +690,26 @@ class StegoApp:
                 return messagebox.showerror("Error", f"Could not read image:\n{p}")
             self.file_path = p
             self.capacity = capacity_bytes(img)
-            self.lbl_path.config(text=f"{os.path.basename(p)}  ·  {img.shape[1]}x{img.shape[0]}")
+            self.image_size = (img.shape[1], img.shape[0])
+            self._update_path_label()
             self.update_capacity()
 
+    # ---------------- çalıştır ----------------
     def run(self):
-        pwd = self.ent_pwd.get()
-        if not self.file_path or not pwd:
-            return messagebox.showerror("Error", "Please select an image and enter a password.")
+        if not self.file_path:
+            return messagebox.showerror("Error", "Please select an image.")
         out = map_path = None
-        if self.mode.get() == "ENCODE":
-            msg = self.txt.get("1.0", tk.END).strip()
-            if not msg:
+        if self.encoding:
+            self.save_locker()
+            msgs = [(l["text"].strip(), l["pwd"]) for l in self.lockers if l["text"].strip()]
+            if not msgs:
                 return messagebox.showwarning("Warning", "Secret message cannot be empty.")
+            missing = [i + 1 for i, l in enumerate(self.lockers) if l["text"].strip() and not l["pwd"]]
+            if missing:
+                return messagebox.showerror("Error", f"Locker {missing[0]} has a message but no password.")
+            pwds = [p for _, p in msgs]
+            if len(set(pwds)) != len(pwds):
+                return messagebox.showerror("Error", "Each locker must have a different password.")
             base = os.path.splitext(os.path.basename(self.file_path))[0]
             out = filedialog.asksaveasfilename(defaultextension=".png", initialfile=f"{base}_stego.png",
                                                filetypes=[("PNG", "*.png"), ("BMP", "*.bmp")])
@@ -591,23 +717,31 @@ class StegoApp:
                 return
             if self.show_map.get():
                 map_path = os.path.splitext(out)[0] + "_map.png"
+            args = (msgs, out, map_path)
+            n_kdf = len(msgs)
         else:
-            msg = None
+            pwd = self.ent_pwd.get()
+            if not pwd:
+                return messagebox.showerror("Error", "Please enter a password.")
+            args = (pwd,)
+            n_kdf = 1
         self.busy = True
         self.update_capacity()
-        self.lbl_status.config(text="Working... (key derivation takes a moment)")
-        threading.Thread(target=self.worker, args=(pwd, msg, out, map_path), daemon=True).start()
+        self.lbl_status.config(text=f"Working... ({n_kdf} key derivation{'s' if n_kdf > 1 else ''}, "
+                                    "takes a moment)")
+        threading.Thread(target=self.worker, args=(self.encoding, args), daemon=True).start()
 
-    def worker(self, pwd, msg, out, map_path):
+    def worker(self, encoding, args):
         try:
-            if msg is not None:
-                res = embed_data(self.file_path, out, msg, pwd, map_path)
+            if encoding:
+                msgs, out, map_path = args
+                res = embed_data(self.file_path, out, msgs, map_path)
             else:
-                res = extract_data(self.file_path, pwd)
+                res = extract_data(self.file_path, args[0])
         except Exception as e:
             res = f"ERROR: {e}"
         # Tkinter thread-safe değildir → sonucu ana thread'e gönder
-        self.root.after(0, self.show_result, res, msg is not None)
+        self.root.after(0, self.show_result, res, encoding)
 
     def show_result(self, res, encoding):
         self.busy = False
@@ -618,7 +752,7 @@ class StegoApp:
                 messagebox.showinfo("Success", res)
             else:
                 messagebox.showerror("Error", res)
-        else:
+        elif not self.encoding:                     # kullanıcı bu arada mod değiştirmediyse
             self.txt.config(state="normal")
             self.txt.delete("1.0", tk.END)
             self.txt.insert("1.0", res)
@@ -629,4 +763,3 @@ if __name__ == "__main__":
     root = tk.Tk()
     StegoApp(root)
     root.mainloop()
-  
