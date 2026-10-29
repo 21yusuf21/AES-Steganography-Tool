@@ -1,13 +1,6 @@
 """
 Doku-Uyarlamalı (Content-Adaptive) DCT-QIM Steganografi  —  v3
 ================================================================
-v3 yenilikleri:
-* Mesaj şifrelenmeden önce sıkıştırılır (raw DEFLATE); yalnızca gerçekten küçülürse.
-* Şifreli verinin içinde 1 baytlık FORMAT BAYTI: sıkıştırma bayrağı + yük türü
-  (ileride dosya gizleme için yer hazır).
-* Nonce artık saklanmıyor; anahtarla birlikte salt'tan türetiliyor → 12 bayt kazanç.
-* Başlığın üst 4 biti format sürümü: v2 ile gizlenmiş görüntüler hâlâ çözülür.
-
 * Veri yalnızca MAVİ (B) kanalın 8x8 DCT bloklarına (2 orta frekans katsayısı) gömülür.
 * "Karışık / dokulu" bölge skoru, HİÇ DEĞİŞTİRİLMEYEN R ve G kanallarından hesaplanır
   → çözücü aynı doku haritasını stego görüntüde yeniden üretebilir.
@@ -15,9 +8,12 @@ v3 yenilikleri:
   Kodlayıcı her bitin yuvalarından yalnızca dokulu olanlara gömer, düz bloklara dokunmaz.
   Çözücü doku ağırlıklı yumuşak oylama yapar: düz blokların oyu ≈ 0.
   Böylece doku skoru biraz değişse bile (gürültü vb.) senkronizasyon kaybolmaz.
-* Şifreleme: PBKDF2 (200k iterasyon, tuzlu) + AES-256-GCM (kimlik doğrulamalı).
+* Anahtar türetme: Argon2id (bellek-zor; GPU ile kaba kuvveti çok pahalılaştırır).
+* Şifreleme: AES-256-GCM (kimlik doğrulamalı). Nonce saklanmaz, anahtarla birlikte türetilir.
+* Mesaj şifrelenmeden önce sıkıştırılır (raw DEFLATE), yalnızca gerçekten küçülürse.
+  Şifreli verinin ilk baytı FORMAT BAYTI: sıkıştırma bayrağı + yük türü.
 
-Gereksinimler: pip install opencv-python numpy pycryptodome
+Gereksinimler: pip install opencv-python numpy pycryptodome argon2-cffi
 """
 
 import os
@@ -28,9 +24,8 @@ from tkinter import filedialog, messagebox, scrolledtext
 
 import cv2
 import numpy as np
+from argon2.low_level import Type, hash_secret_raw
 from Crypto.Cipher import AES
-from Crypto.Protocol.KDF import PBKDF2
-from Crypto.Hash import SHA256
 from Crypto.Random import get_random_bytes
 
 # ==========================================
@@ -42,15 +37,15 @@ SLOTS_PER_BIT = 3          # Her bit için ayrılan (blok, katsayı) yuvası say
 TEXTURE_PERCENTILE = 50    # Skoru bu yüzdeliğin altındaki bloklara normalde DOKUNULMAZ
 Q_STEP = 24.0              # QIM kuantizasyon adımı (sadece dokulu bloklara uygulanır)
 MIN_MARGIN = 0.6           # Kodlayıcının istediği en düşük ağırlıklı oy farkı
-HEADER_BITS = 32           # Başlık: üst 4 bit = format sürümü, alt 28 bit = yük uzunluğu (bit)
-VERSION_SHIFT = 28
-LENGTH_MASK = (1 << VERSION_SHIFT) - 1
-FORMAT_VERSION = 1         # 0 = v2 (eski), 1 = v3 (bu sürüm)
-KDF_ITER = 200_000
-MAP_SALT = b"stego-dct-map-v2"   # yuva haritası değişmedi (v2 görüntüleri okunabilsin diye)
+HEADER_BITS = 32           # Yük uzunluğu (bit) başlığı
+
+# Argon2id parametreleri (RFC 9106'nın düşük bellekli önerisi: t=3, m=64 MiB, p=4)
+ARGON2_TIME = 3            # geçiş sayısı
+ARGON2_MEMORY_KIB = 64 * 1024
+ARGON2_LANES = 4
+MAP_SALT = b"stego-dct-map-v3"
 SALT_LEN, NONCE_LEN, TAG_LEN = 16, 12, 16
-OVERHEAD_V2 = SALT_LEN + NONCE_LEN + TAG_LEN     # 44: salt | nonce | tag | ct
-OVERHEAD = SALT_LEN + TAG_LEN                    # 32: salt | tag | ct   (nonce türetiliyor)
+OVERHEAD = SALT_LEN + TAG_LEN    # 32 bayt: salt | tag | ct   (nonce türetiliyor)
 
 # Format baytı (şifreli verinin İLK baytı, yani dışarıdan görünmez)
 #   bit 0     : 1 = gövde DEFLATE ile sıkıştırılmış
@@ -85,10 +80,13 @@ def save_image_unicode(path, img):
 
 
 # ==========================================
-# 2) KRİPTO  (PBKDF2 + AES-256-GCM)
+# 2) KRİPTO  (Argon2id + AES-256-GCM)
 # ==========================================
-def _kdf(password, salt, n=32, it=KDF_ITER):
-    return PBKDF2(password, salt, dkLen=n, count=it, hmac_hash_module=SHA256)
+def _kdf(password, salt, n=32):
+    """Argon2id. Her tahmin için 64 MiB bellek ister → GPU/ASIC ile toplu deneme pahalı."""
+    return hash_secret_raw(password.encode("utf-8"), salt, time_cost=ARGON2_TIME,
+                           memory_cost=ARGON2_MEMORY_KIB, parallelism=ARGON2_LANES,
+                           hash_len=n, type=Type.ID)
 
 
 def _key_and_nonce(password, salt):
@@ -100,7 +98,7 @@ def _key_and_nonce(password, salt):
 
 
 def encrypt_payload(data, password):
-    """v3. Girdi: bayt. Çıktı: salt | tag | ciphertext"""
+    """Girdi: bayt. Çıktı: salt | tag | ciphertext"""
     salt = get_random_bytes(SALT_LEN)
     key, nonce = _key_and_nonce(password, salt)
     ct, tag = AES.new(key, AES.MODE_GCM, nonce=nonce).encrypt_and_digest(data)
@@ -108,7 +106,7 @@ def encrypt_payload(data, password):
 
 
 def decrypt_payload(blob, password):
-    """v3. Başarısızlıkta None (yanlış şifre veya bozuk veri)."""
+    """Başarısızlıkta None (yanlış şifre veya bozuk veri)."""
     if len(blob) < OVERHEAD:
         return None
     salt, tag, ct = blob[:SALT_LEN], blob[SALT_LEN:OVERHEAD], blob[OVERHEAD:]
@@ -116,19 +114,6 @@ def decrypt_payload(blob, password):
     try:
         return AES.new(key, AES.MODE_GCM, nonce=nonce).decrypt_and_verify(ct, tag)
     except ValueError:
-        return None
-
-
-def decrypt_payload_v2(blob, password):
-    """Eski (v2) format: salt | nonce | tag | ciphertext, düz UTF-8 metin."""
-    if len(blob) < OVERHEAD_V2:
-        return None
-    salt, nonce = blob[:SALT_LEN], blob[SALT_LEN:SALT_LEN + NONCE_LEN]
-    tag, ct = blob[SALT_LEN + NONCE_LEN:OVERHEAD_V2], blob[OVERHEAD_V2:]
-    try:
-        cipher = AES.new(_kdf(password, salt), AES.MODE_GCM, nonce=nonce)
-        return cipher.decrypt_and_verify(ct, tag).decode("utf-8")
-    except (ValueError, UnicodeDecodeError):
         return None
 
 
@@ -217,7 +202,7 @@ def slot_map(n_blocks, password):
     Şifreden türetilmiş SABİT yuva haritası: (blok, katsayı) çiftlerinin karışık sırası.
     Doku haritasından bağımsız olduğu için gürültü vs. senkronizasyonu bozamaz.
     """
-    seed = _kdf(password, MAP_SALT, n=16, it=KDF_ITER // 4)
+    seed = _kdf(password, MAP_SALT, n=16)
     rng = np.random.default_rng(int.from_bytes(seed, "big"))
     slots = np.arange(n_blocks * len(COEFS))
     rng.shuffle(slots)
@@ -310,11 +295,10 @@ def capacity_bytes(img):
     return max(0, raw_capacity_bytes(img) - OVERHEAD)
 
 
-def embed_bytes(img, blob, password, version=FORMAT_VERSION):
+def embed_bytes(img, blob, password):
     """Bellekte gömme. (stego, kullanılan_bloklar, istatistik) döndürür."""
     bits = np.unpackbits(np.frombuffer(blob, np.uint8))
-    header_val = (version << VERSION_SHIFT) | bits.size
-    header = np.array([int(c) for c in format(header_val, f"0{HEADER_BITS}b")], np.uint8)
+    header = np.array([int(c) for c in format(bits.size, f"0{HEADER_BITS}b")], np.uint8)
     all_bits = hamming_encode(np.concatenate([header, bits]))
 
     score, bw = block_texture(img)
@@ -359,7 +343,7 @@ def embed_bytes(img, blob, password, version=FORMAT_VERSION):
 
 
 def extract_bytes(img, password):
-    """(format_sürümü, gömülü_baytlar) döndürür; geçerli başlık yoksa (None, None)."""
+    """Gömülü baytları döndürür; geçerli bir başlık yoksa None."""
     score, bw = block_texture(img)      # R,G değişmediği için aynı (veya çok yakın) harita
     _, w, q = texture_params(score)
     slots = slot_map(score.size, password)
@@ -370,21 +354,17 @@ def extract_bytes(img, password):
 
     hc = coded_len(HEADER_BITS)                       # başlık 4'ün katı → kendi kod sözcükleri
     header = hamming_decode(np.array([bit_at(i) for i in range(hc)], np.uint8))
-    header_val = int("".join(map(str, header)), 2)
-    version, L = header_val >> VERSION_SHIFT, header_val & LENGTH_MASK
-    min_bytes = {0: OVERHEAD_V2, 1: OVERHEAD + 1}.get(version)   # v2 / v3
+    L = int("".join(map(str, header)), 2)
     total = coded_len(HEADER_BITS + L)
-    if min_bytes is None or L < min_bytes * 8 or L % 8 or total * SLOTS_PER_BIT > slots.size:
-        return None, None
+    if L < (OVERHEAD + 1) * 8 or L % 8 or total * SLOTS_PER_BIT > slots.size:
+        return None
     code = np.array([bit_at(i) for i in range(total)], np.uint8)
     bits = hamming_decode(code)[HEADER_BITS:HEADER_BITS + L]
-    return version, np.packbits(bits).tobytes()
+    return np.packbits(bits).tobytes()
 
 
-def decode_blob(version, blob, password):
-    """Sürüme göre şifreyi çöz ve metni döndür; başarısızlıkta None."""
-    if version == 0:
-        return decrypt_payload_v2(blob, password)
+def decode_blob(blob, password):
+    """Şifreyi çöz ve metni döndür; başarısızlıkta None."""
     data = decrypt_payload(blob, password)
     return None if data is None else unpack_payload(data)
 
@@ -399,8 +379,8 @@ def embed_data(image_path, output_path, secret_text, password, map_path=None):
     except ValueError as e:
         return f"ERROR: {e}"
 
-    version, blob = extract_bytes(stego, password)
-    ok = blob is not None and decode_blob(version, blob, password) == secret_text
+    blob = extract_bytes(stego, password)
+    ok = blob is not None and decode_blob(blob, password) == secret_text
     if not save_image_unicode(output_path, stego):
         return f"ERROR: Could not save image!\nPath: {output_path}"
     if map_path:
@@ -418,10 +398,10 @@ def extract_data(image_path, password):
     img = read_image_unicode(image_path)
     if img is None:
         return f"ERROR: Could not read image!\nPath: {image_path}"
-    version, blob = extract_bytes(img, password)
+    blob = extract_bytes(img, password)
     if blob is None:
         return "ERROR: Wrong password or no hidden data in this image."
-    result = decode_blob(version, blob, password)
+    result = decode_blob(blob, password)
     if result is None:
         return "ERROR: Authentication failed (wrong password or corrupted image)."
     return result
@@ -649,3 +629,4 @@ if __name__ == "__main__":
     root = tk.Tk()
     StegoApp(root)
     root.mainloop()
+  
