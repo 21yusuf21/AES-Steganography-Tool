@@ -1,6 +1,6 @@
 """
-Doku-Uyarlamalı (Content-Adaptive) DCT-QIM Steganografi  —  v4 (inkâr edilebilir)
-==================================================================================
+Doku-Uyarlamalı (Content-Adaptive) DCT-QIM Steganografi  —  v5 (inkâr edilebilir, dosya destekli)
+==================================================================================================
 * Veri yalnızca MAVİ (B) kanalın 8x8 DCT bloklarına (2 orta frekans katsayısı) gömülür.
 * "Karışık / dokulu" bölge skoru, HİÇ DEĞİŞTİRİLMEYEN R ve G kanallarından hesaplanır
   → çözücü aynı doku haritasını stego görüntüde yeniden üretebilir.
@@ -20,9 +20,11 @@ Görüntünün TÜM kapasitesi tek bir "konteyner" olarak yazılır:
   Şifreli veri rastgeleden ayırt edilemez → kaç mesaj olduğu anlaşılamaz.
 * Çözücü girilen şifreyle 4 hücreyi de dener; yalnızca o şifrenin mesajı açılır.
 
+* Her kasa ya METİN ya DOSYA tutar. Dosyada orijinal ad (uzantı dahil) da şifreli olarak
+  saklanır; çözülürken bu adla kaydedilir (ad önce güvenli hâle getirilir).
 * Anahtar türetme: Argon2id (bellek-zor). Şifre başına tek çağrı, global salt ile.
-* Mesaj şifrelenmeden önce sıkıştırılır (raw DEFLATE), yalnızca gerçekten küçülürse.
-  Şifreli mesajın ilk baytı FORMAT BAYTI: sıkıştırma bayrağı + yük türü.
+* Yük şifrelenmeden önce sıkıştırılır (raw DEFLATE), yalnızca gerçekten küçülürse.
+  Şifreli yükün ilk baytı FORMAT BAYTI: sıkıştırma bayrağı + yük türü.
 
 Gereksinimler: pip install opencv-python numpy pycryptodome argon2-cffi
 """
@@ -65,11 +67,16 @@ CELL_LEN = CELL_PLAIN + TAG_LEN       # 24 B
 TABLE_START = SALT_LEN
 DATA_START = TABLE_START + N_LOCKERS * CELL_LEN   # 112 B
 
-# Format baytı (şifreli mesajın İLK baytı)
+# Format baytı (şifreli yükün İLK baytı)
 #   bit 0     : 1 = gövde DEFLATE ile sıkıştırılmış
-#   bit 4..7  : yük türü (0 = UTF-8 metin; ileride 1 = dosya)
+#   bit 4..7  : yük türü
+#                 0 = UTF-8 metin   → gövde: metin
+#                 1 = dosya         → gövde: ad_uzunluğu (1 B) | ad (UTF-8) | içerik
 FLAG_COMPRESSED = 0x01
 TYPE_TEXT = 0
+TYPE_FILE = 1
+MAX_NAME_BYTES = 255
+MAX_FILE_BYTES = 8 * 1024 * 1024  # bundan büyük dosya hiçbir görüntüye sığmaz; seçerken reddet
 MAX_PAYLOAD = 64 * 1024 * 1024   # açılan veri için üst sınır (sıkıştırma bombasına karşı)
 
 
@@ -138,21 +145,65 @@ def _deflate(data):
     return c.compress(data) + c.flush()
 
 
+def _pack(kind, body):
+    """Format baytı + gövde. Sıkıştırma yalnızca gerçekten küçültürse kullanılır."""
+    packed = _deflate(body)
+    if len(packed) < len(body):
+        return bytes([kind << 4 | FLAG_COMPRESSED]) + packed
+    return bytes([kind << 4]) + body
+
+
 def pack_text(text):
-    """Metin → format baytı + gövde. Sıkıştırma yalnızca gerçekten küçültürse kullanılır."""
-    raw = text.encode("utf-8")
-    packed = _deflate(raw)
-    if len(packed) < len(raw):
-        return bytes([TYPE_TEXT << 4 | FLAG_COMPRESSED]) + packed
-    return bytes([TYPE_TEXT << 4]) + raw
+    return _pack(TYPE_TEXT, text.encode("utf-8"))
+
+
+_WIN_RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)),
+                 *(f"LPT{i}" for i in range(1, 10))}
+
+
+def safe_filename(name):
+    """
+    Görüntüden çıkan dosya adına GÜVENME: kötü niyetli bir görüntü '..\\..\\Windows\\x.dll'
+    gibi bir ad taşıyabilir. Klasör kısımlarını, yasak karakterleri ve Windows'un ayrılmış
+    adlarını temizler; sadece düz bir dosya adı bırakır.
+    """
+    name = name.replace("\\", "/").split("/")[-1]                      # sadece son parça
+    name = "".join(c for c in name if c >= " " and c not in '<>:"|?*')  # kontrol + yasak karakterler
+    name = name.strip(" .")                                            # Windows sondaki nokta/boşluk
+    if not name:
+        return "hidden_file.bin"
+    if name.split(".")[0].upper() in _WIN_RESERVED:
+        name = "_" + name
+    return name
+
+
+def _limit_name(name):
+    """UTF-8'de MAX_NAME_BYTES'ı aşan adı, uzantıyı koruyarak kısalt."""
+    if len(name.encode("utf-8")) <= MAX_NAME_BYTES:
+        return name
+    stem, ext = os.path.splitext(name)
+    ext = ext[:20]
+    while len((stem + ext).encode("utf-8")) > MAX_NAME_BYTES:
+        stem = stem[:-1]
+    return stem + ext
+
+
+def pack_file(name, content):
+    """Dosya → format baytı + [ad uzunluğu | ad | içerik] (gerekirse sıkıştırılmış)."""
+    name_b = _limit_name(safe_filename(name)).encode("utf-8")
+    return _pack(TYPE_FILE, bytes([len(name_b)]) + name_b + content)
 
 
 def unpack_payload(data):
-    """Format baytı + gövde → metin. Tanınmayan biçimde None."""
+    """
+    Format baytı + gövde → ("text", metin)  veya  ("file", güvenli_ad, içerik).
+    Tanınmayan / bozuk biçimde None.
+    """
     if not data:
         return None
     flags, body = data[0], data[1:]
-    if flags >> 4 != TYPE_TEXT or flags & 0x0E:     # bilinmeyen tür / ayrılmış bitler
+    kind = flags >> 4
+    if kind not in (TYPE_TEXT, TYPE_FILE) or flags & 0x0E:   # bilinmeyen tür / ayrılmış bitler
         return None
     if flags & FLAG_COMPRESSED:
         d = zlib.decompressobj(-15)
@@ -162,46 +213,59 @@ def unpack_payload(data):
             return None
         if d.unconsumed_tail:                        # sınırı aştı
             return None
+    if kind == TYPE_TEXT:
+        try:
+            return ("text", body.decode("utf-8"))
+        except UnicodeDecodeError:
+            return None
+    if not body or len(body) < 1 + body[0]:
+        return None
+    n = body[0]
     try:
-        return body.decode("utf-8")
+        name = body[1:1 + n].decode("utf-8")
     except UnicodeDecodeError:
         return None
+    return ("file", safe_filename(name), body[1 + n:])
+
+
+def payload_cost(payload):
+    """Paketlenmiş yükün veri alanında kapladığı bayt (doğrulama etiketi dahil)."""
+    return TAG_LEN + len(payload)
 
 
 def message_cost(text):
-    """Bir mesajın veri alanında kapladığı bayt: doğrulama etiketi + format baytı + gövde.
-    Boş mesaj kasa kullanmaz → 0. run() ile aynı şekilde strip edilir."""
+    """Bir metin mesajının kapladığı bayt. Boş mesaj kasa kullanmaz → 0. strip edilir."""
     text = text.strip()
-    return TAG_LEN + len(pack_text(text)) if text else 0
+    return payload_cost(pack_text(text)) if text else 0
 
 
 # ==========================================
 # 3) KONTEYNER (inkâr edilebilir kasalar)
 # ==========================================
-def build_container(size, messages):
+def build_container(size, items):
     """
-    messages: [(metin, şifre), ...]  (1..N_LOCKERS adet)
+    items: [(paketlenmiş_yük, şifre), ...]  (1..N_LOCKERS adet; yük = pack_text / pack_file çıktısı)
     Dönen: tam olarak `size` baytlık konteyner. Kullanılmayan her yer rastgele.
     """
-    if not 1 <= len(messages) <= N_LOCKERS:
-        raise ValueError(f"Between 1 and {N_LOCKERS} messages are supported.")
-    pwds = [p for _, p in messages]
+    if not 1 <= len(items) <= N_LOCKERS:
+        raise ValueError(f"Between 1 and {N_LOCKERS} lockers can be filled.")
+    pwds = [p for _, p in items]
     if any(not p for p in pwds):
-        raise ValueError("Every message needs a password.")
+        raise ValueError("Every locker needs a password.")
     if len(set(pwds)) != len(pwds):
-        raise ValueError("Each message must have a different password.")
-    need = DATA_START + sum(message_cost(t) for t, _ in messages)
+        raise ValueError("Each locker must have a different password.")
+    need = DATA_START + sum(payload_cost(p) for p, _ in items)
     if need > size:
-        raise ValueError(f"Messages are too long: {need - DATA_START} bytes needed, "
+        raise ValueError(f"Content is too large: {need - DATA_START} bytes needed, "
                          f"capacity is {max(0, size - DATA_START)} bytes.")
 
     box = bytearray(secrets.token_bytes(size))     # her şey önce rastgele
     gsalt = bytes(box[:SALT_LEN])                   # global salt da rastgele baytların parçası
-    cells = secrets.SystemRandom().sample(range(N_LOCKERS), len(messages))  # hangi hücre: rastgele
+    cells = secrets.SystemRandom().sample(range(N_LOCKERS), len(items))  # hangi hücre: rastgele
     pos = DATA_START
-    for (text, pwd), cell in zip(messages, cells):
+    for (payload, pwd), cell in zip(items, cells):
         key, n_cell, n_msg = derive_keys(pwd, gsalt)
-        body = _seal(key, n_msg, pack_text(text.strip()))
+        body = _seal(key, n_msg, payload)
         box[pos:pos + len(body)] = body
         entry = _seal(key, n_cell, struct.pack(">II", pos, len(body)))
         c0 = TABLE_START + cell * CELL_LEN
@@ -211,7 +275,7 @@ def build_container(size, messages):
 
 
 def open_container(box, password):
-    """Şifrenin kasasındaki metni döndürür; bu şifreye ait kasa yoksa None."""
+    """Şifrenin kasasını açar: ("text", metin) / ("file", ad, içerik); kasa yoksa None."""
     if len(box) < DATA_START:
         return None
     key, n_cell, n_msg = derive_keys(password, box[:SALT_LEN])
@@ -420,16 +484,15 @@ def extract_bytes(img):
     return np.packbits(bits).tobytes()
 
 
-def embed_data(image_path, output_path, messages, map_path=None):
-    """messages: [(metin, şifre), ...] — boş metinler atlanır."""
+def embed_data(image_path, output_path, items, map_path=None):
+    """items: [(paketlenmiş_yük, şifre), ...] — pack_text() / pack_file() ile hazırlanır."""
     img = read_image_unicode(image_path)
     if img is None:
         return f"ERROR: Could not read image!\nPath: {image_path}"
-    messages = [(t.strip(), p) for t, p in messages if t.strip()]
-    if not messages:
-        return "ERROR: Secret message cannot be empty."
+    if not items:
+        return "ERROR: Nothing to hide."
     try:
-        box = build_container(container_size(img), messages)
+        box = build_container(container_size(img), items)
         stego, used, st = embed_bytes(img, box)
     except ValueError as e:
         return f"ERROR: {e}"
@@ -444,8 +507,8 @@ def embed_data(image_path, output_path, messages, map_path=None):
     if map_path:
         _, bw = block_texture(img)
         save_usage_map(img, used, bw, map_path)
-    used_b = sum(message_cost(t) for t, _ in messages)
-    return (f"Success\nMessages hidden: {len(messages)} (image always has {N_LOCKERS} lockers)\n"
+    used_b = sum(payload_cost(p) for p, _ in items)
+    return (f"Success\nLockers filled: {len(items)} (image always has {N_LOCKERS} lockers)\n"
             f"Used: {used_b}/{capacity_bytes(img)} bytes, rest filled with random data\n"
             f"Modified blocks: {st['used']}/{st['total']} "
             f"(%{100 * st['used'] / st['total']:.1f}); low-texture slots touched: {st['forced_flat']}\n"
@@ -453,14 +516,19 @@ def embed_data(image_path, output_path, messages, map_path=None):
 
 
 def extract_data(image_path, password):
+    """("text", metin) / ("file", güvenli_ad, içerik) / ("error", mesaj) döndürür."""
     img = read_image_unicode(image_path)
     if img is None:
-        return f"ERROR: Could not read image!\nPath: {image_path}"
+        return ("error", f"Could not read image!\nPath: {image_path}")
     result = open_container(extract_bytes(img), password)
     if result is None:
         # Bilerek ayrım yapılmıyor: "görüntüde veri yok" ile "yanlış şifre" aynı görünmeli.
-        return "ERROR: No message found for this password."
+        return ("error", "No message found for this password.")
     return result
+
+
+def human_size(n):
+    return f"{n} B" if n < 1024 else f"{n / 1024:.1f} KB" if n < 1024 ** 2 else f"{n / 1024 ** 2:.1f} MB"
 
 
 # ==========================================
@@ -497,8 +565,26 @@ def capacity_level(used, cap):
     return "warn" if cap and used / cap >= 0.8 else "ok"
 
 
+def new_locker():
+    return {"pwd": "", "kind": "text", "text": "",
+            "file_name": None, "file_size": 0, "file_payload": None}
+
+
+def locker_payload(l):
+    """Kasanın paketlenmiş yükü; boş kasa → None."""
+    if l["kind"] == "file":
+        return l["file_payload"]
+    t = l["text"].strip()
+    return pack_text(t) if t else None
+
+
+def locker_cost(l):
+    p = locker_payload(l)
+    return payload_cost(p) if p is not None else 0
+
+
 class CapacityMeter(tk.Frame):
-    """Mesaj yazılırken canlı güncellenen kapasite çubuğu (tüm kasaların toplamı)."""
+    """Canlı güncellenen kapasite çubuğu (tüm kasaların toplamı)."""
 
     def __init__(self, master):
         super().__init__(master, bg=PANEL)
@@ -536,19 +622,20 @@ class CapacityMeter(tk.Frame):
 class StegoApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("AES Steganography Tool v4 (Deniable Lockers)")
-        self.root.geometry("640x680")
+        self.root.title("AES Steganography Tool v5 (Deniable Lockers + Files)")
+        self.root.geometry("640x700")
         self.root.configure(bg=BG)
         self.file_path = None
         self.capacity = None      # seçili görüntünün kapasitesi (bayt); mod değişince korunur
         self.busy = False
-        self.lockers = [{"pwd": "", "text": ""} for _ in range(N_LOCKERS)]
+        self.lockers = [new_locker() for _ in range(N_LOCKERS)]
         self.cur = 0              # düzenlenen kasa
         self.locker_btns = []
+        self._built_encode = False
         self.setup_ui()
 
     def setup_ui(self):
-        tk.Label(self.root, text="AES Crypto-Stego Station v4", fg="#00ff00", bg=BG,
+        tk.Label(self.root, text="AES Crypto-Stego Station v5", fg="#00ff00", bg=BG,
                  font=("Courier", 18, "bold")).pack(pady=15)
         self.mode = tk.StringVar(value="ENCODE")
         tf = tk.Frame(self.root, bg=BG); tf.pack(pady=5)
@@ -565,8 +652,12 @@ class StegoApp:
     def encoding(self):
         return self.mode.get() == "ENCODE"
 
+    def _label(self, text, **pack):
+        tk.Label(self.main_frame, text=text, fg="white", bg=PANEL,
+                 font=("Arial", 10, "bold")).pack(**({"pady": (10, 0)} | pack))
+
     def refresh(self):
-        if getattr(self, "txt", None) is not None and getattr(self, "_built_encode", False):
+        if self._built_encode:
             self.save_locker()                      # mod değişmeden önce düzenlenen kasayı kaydet
         for w in self.main_frame.winfo_children():
             w.destroy()
@@ -585,28 +676,54 @@ class StegoApp:
             tk.Label(lf, text="Locker:", fg="white", bg=PANEL,
                      font=("Arial", 10, "bold")).pack(side="left", padx=(0, 8))
             for i in range(N_LOCKERS):
-                b = tk.Button(lf, width=5, command=lambda i=i: self.switch_locker(i),
+                b = tk.Button(lf, width=7, command=lambda i=i: self.switch_locker(i),
                               fg="white", relief="flat", font=("Arial", 9, "bold"))
                 b.pack(side="left", padx=2)
                 self.locker_btns.append(b)
-            tk.Label(self.main_frame, text="Each locker = one message + its own password. "
+            tk.Label(self.main_frame, text="Each locker = one message or file + its own password. "
                                            "Empty lockers are filled with random data.",
                      fg=MUTED, bg=PANEL, font=("Arial", 8)).pack()
 
-        tk.Label(self.main_frame, text="Password:", fg="white", bg=PANEL,
-                 font=("Arial", 10, "bold")).pack(pady=(10, 0))
+        self._label("Password:")
         self.ent_pwd = tk.Entry(self.main_frame, show="*", width=35, bg=FIELD, fg="white",
                                 insertbackground="white")
         self.ent_pwd.pack(pady=5)
 
-        tk.Label(self.main_frame, text="Secret Message:" if enc else "Decoded Message:",
-                 fg="white", bg=PANEL, font=("Arial", 10, "bold")).pack(pady=(10, 0))
-        self.txt = scrolledtext.ScrolledText(self.main_frame, height=8, width=58, bg=FIELD,
+        if enc:
+            kf = tk.Frame(self.main_frame, bg=PANEL); kf.pack(pady=(8, 0))
+            tk.Label(kf, text="Content:", fg="white", bg=PANEL,
+                     font=("Arial", 10, "bold")).pack(side="left", padx=(0, 8))
+            self.kind_var = tk.StringVar(value="text")
+            for text, val in (("Text", "text"), ("File", "file")):
+                tk.Radiobutton(kf, text=text, variable=self.kind_var, value=val, fg="white", bg=PANEL,
+                               selectcolor=FIELD, activebackground=PANEL, activeforeground="white",
+                               command=self.on_kind_change).pack(side="left", padx=6)
+        else:
+            self._label("Decoded Message / File:")
+
+        # İçerik alanı: metin kutusu ya da dosya paneli (biri gösterilir)
+        self.content = tk.Frame(self.main_frame, bg=PANEL)
+        self.content.pack(pady=(5, 2), fill="both", expand=True)
+        self.txt = scrolledtext.ScrolledText(self.content, height=8, width=58, bg=FIELD,
                                              fg="#00ff00", insertbackground="white",
                                              font=("Consolas", 10), wrap="word")
-        self.txt.pack(pady=(5, 2), fill="both", expand=True)
+        self.file_frame = tk.Frame(self.content, bg=FIELD, padx=15, pady=15)
+        fb = tk.Frame(self.file_frame, bg=FIELD); fb.pack(anchor="w")
+        tk.Button(fb, text="Choose file…", command=self.choose_file, bg="#444", fg="white",
+                  width=14).pack(side="left")
+        tk.Button(fb, text="Remove", command=self.remove_file, bg="#444", fg="white",
+                  width=8).pack(side="left", padx=6)
+        self.lbl_file = tk.Label(self.file_frame, text="", fg="#00ff00", bg=FIELD, justify="left",
+                                 anchor="w", font=("Consolas", 10), wraplength=520)
+        self.lbl_file.pack(anchor="w", pady=(12, 0), fill="x")
+        tk.Label(self.file_frame, text="Any file type works. Plain-text files (.txt, .csv, .json, code) "
+                                       "compress well;\n.docx/.pdf/.jpg/.zip are already compressed "
+                                       "and usually need a large image.",
+                 fg=MUTED, bg=FIELD, justify="left", font=("Arial", 8)).pack(anchor="w", pady=(12, 0))
+
         self.meter = None
         if not enc:
+            self.txt.pack(fill="both", expand=True)
             self.txt.config(state="disabled")
         else:
             self.meter = CapacityMeter(self.main_frame)
@@ -629,25 +746,81 @@ class StegoApp:
 
     # ---------------- kasalar ----------------
     def save_locker(self):
-        self.lockers[self.cur] = {"pwd": self.ent_pwd.get(), "text": self.txt.get("1.0", "end-1c")}
+        l = self.lockers[self.cur]
+        l["pwd"] = self.ent_pwd.get()
+        l["text"] = self.txt.get("1.0", "end-1c")
+        l["kind"] = self.kind_var.get()
 
     def load_locker(self, i):
         self.cur = i
+        l = self.lockers[i]
         self.ent_pwd.delete(0, tk.END)
-        self.ent_pwd.insert(0, self.lockers[i]["pwd"])
+        self.ent_pwd.insert(0, l["pwd"])
         self.txt.delete("1.0", tk.END)
-        self.txt.insert("1.0", self.lockers[i]["text"])
+        self.txt.insert("1.0", l["text"])
         self.txt.edit_modified(False)
+        self.kind_var.set(l["kind"])
+        self._show_content(l["kind"])
+        self._update_file_label()
 
     def switch_locker(self, i):
         self.save_locker()
         self.load_locker(i)
         self.update_capacity()
 
+    def _show_content(self, kind):
+        if kind == "file":
+            self.txt.pack_forget()
+            self.file_frame.pack(fill="both", expand=True)
+        else:
+            self.file_frame.pack_forget()
+            self.txt.pack(fill="both", expand=True)
+
+    def on_kind_change(self):
+        self._show_content(self.kind_var.get())
+        self.update_capacity()
+
+    def choose_file(self):
+        p = filedialog.askopenfilename(title="Choose a file to hide")
+        if not p:
+            return
+        try:
+            size = os.path.getsize(p)
+            if size > MAX_FILE_BYTES:
+                return messagebox.showerror("Error", f"File is too large ({human_size(size)}). "
+                                                     f"No image can hold it.")
+            with open(p, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            return messagebox.showerror("Error", f"Could not read file:\n{e}")
+        l = self.lockers[self.cur]
+        l["file_name"] = os.path.basename(p)
+        l["file_size"] = len(data)
+        l["file_payload"] = pack_file(l["file_name"], data)   # bir kez sıkıştır, sonra önbellekten
+        self._update_file_label()
+        self.update_capacity()
+
+    def remove_file(self):
+        l = self.lockers[self.cur]
+        l["file_name"], l["file_size"], l["file_payload"] = None, 0, None
+        self._update_file_label()
+        self.update_capacity()
+
+    def _update_file_label(self):
+        l = self.lockers[self.cur]
+        if l["file_payload"] is None:
+            self.lbl_file.config(text="No file chosen", fg=MUTED)
+            return
+        comp = " (compressed)" if l["file_payload"][0] & FLAG_COMPRESSED else ""
+        self.lbl_file.config(text=f"{l['file_name']}\n{human_size(l['file_size'])}  →  "
+                                  f"takes {human_size(locker_cost(l))} in the image{comp}", fg="#00ff00")
+
     def _style_locker_buttons(self):
         for i, b in enumerate(self.locker_btns):
-            filled = bool(self.lockers[i]["text"].strip())
-            b.config(text=f"{i + 1}{' ●' if filled else ''}",
+            l = self.lockers[i]
+            filled = locker_payload(l) is not None
+            tag = (" file" if l["kind"] == "file" else " txt") if filled else ""
+            b.config(text=f"{i + 1}{tag}",
                      bg="#2e7d32" if i == self.cur else ("#3d5a40" if filled else "#444"))
 
     # ---------------- kapasite göstergesi ----------------
@@ -657,15 +830,18 @@ class StegoApp:
         self.update_capacity()
 
     def update_capacity(self):
-        """Göstergeyi günceller; mesajlar sığmıyorsa gizleme butonunu kapatır."""
+        """Göstergeyi günceller; içerik sığmıyorsa gizleme butonunu kapatır."""
         enabled = not self.busy
         if self.meter is not None:
             self.save_locker()
-            used = sum(message_cost(l["text"]) for l in self.lockers)
-            cur = self.lockers[self.cur]["text"].strip()
-            note = f"  ·  locker {self.cur + 1}: {message_cost(cur)} B" if cur else ""
-            if cur and pack_text(cur)[0] & FLAG_COMPRESSED:
-                note += " (compressed)"
+            used = sum(locker_cost(l) for l in self.lockers)
+            cur = self.lockers[self.cur]
+            p = locker_payload(cur)
+            note = ""
+            if p is not None:
+                note = f"  ·  locker {self.cur + 1}: {payload_cost(p)} B"
+                if p[0] & FLAG_COMPRESSED:
+                    note += " (compressed)"
             self.meter.update_meter(used, self.capacity, note)
             if self.capacity is not None and used > self.capacity:
                 enabled = False
@@ -701,15 +877,16 @@ class StegoApp:
         out = map_path = None
         if self.encoding:
             self.save_locker()
-            msgs = [(l["text"].strip(), l["pwd"]) for l in self.lockers if l["text"].strip()]
-            if not msgs:
-                return messagebox.showwarning("Warning", "Secret message cannot be empty.")
-            missing = [i + 1 for i, l in enumerate(self.lockers) if l["text"].strip() and not l["pwd"]]
+            filled = [(i, l) for i, l in enumerate(self.lockers) if locker_payload(l) is not None]
+            if not filled:
+                return messagebox.showwarning("Warning", "Write a message or choose a file first.")
+            missing = [i + 1 for i, l in filled if not l["pwd"]]
             if missing:
-                return messagebox.showerror("Error", f"Locker {missing[0]} has a message but no password.")
-            pwds = [p for _, p in msgs]
+                return messagebox.showerror("Error", f"Locker {missing[0]} has content but no password.")
+            pwds = [l["pwd"] for _, l in filled]
             if len(set(pwds)) != len(pwds):
                 return messagebox.showerror("Error", "Each locker must have a different password.")
+            items = [(locker_payload(l), l["pwd"]) for _, l in filled]
             base = os.path.splitext(os.path.basename(self.file_path))[0]
             out = filedialog.asksaveasfilename(defaultextension=".png", initialfile=f"{base}_stego.png",
                                                filetypes=[("PNG", "*.png"), ("BMP", "*.bmp")])
@@ -717,8 +894,8 @@ class StegoApp:
                 return
             if self.show_map.get():
                 map_path = os.path.splitext(out)[0] + "_map.png"
-            args = (msgs, out, map_path)
-            n_kdf = len(msgs)
+            args = (items, out, map_path)
+            n_kdf = len(items)
         else:
             pwd = self.ent_pwd.get()
             if not pwd:
@@ -734,14 +911,20 @@ class StegoApp:
     def worker(self, encoding, args):
         try:
             if encoding:
-                msgs, out, map_path = args
-                res = embed_data(self.file_path, out, msgs, map_path)
+                items, out, map_path = args
+                res = embed_data(self.file_path, out, items, map_path)
             else:
                 res = extract_data(self.file_path, args[0])
         except Exception as e:
-            res = f"ERROR: {e}"
+            res = f"ERROR: {e}" if encoding else ("error", str(e))
         # Tkinter thread-safe değildir → sonucu ana thread'e gönder
         self.root.after(0, self.show_result, res, encoding)
+
+    def _show_text(self, text):
+        self.txt.config(state="normal")
+        self.txt.delete("1.0", tk.END)
+        self.txt.insert("1.0", text)
+        self.txt.config(state="disabled")
 
     def show_result(self, res, encoding):
         self.busy = False
@@ -752,11 +935,31 @@ class StegoApp:
                 messagebox.showinfo("Success", res)
             else:
                 messagebox.showerror("Error", res)
-        elif not self.encoding:                     # kullanıcı bu arada mod değiştirmediyse
-            self.txt.config(state="normal")
-            self.txt.delete("1.0", tk.END)
-            self.txt.insert("1.0", res)
-            self.txt.config(state="disabled")
+            return
+        if self.encoding:                            # kullanıcı bu arada mod değiştirdiyse
+            return
+        kind = res[0]
+        if kind == "error":
+            self._show_text("ERROR: " + res[1])
+        elif kind == "text":
+            self._show_text(res[1])
+        else:                                        # dosya: nereye kaydedileceğini sor
+            name, data = res[1], res[2]
+            info = f"Hidden file: {name}  ({human_size(len(data))})\n"
+            path = filedialog.asksaveasfilename(title="Save hidden file", initialfile=name,
+                                                filetypes=[("All files", "*.*")])
+            if not path:
+                self._show_text(info + "\nNot saved. Press REVEAL again to save it.")
+                return
+            try:
+                with open(path, "wb") as f:
+                    f.write(data)
+            except OSError as e:
+                self._show_text(info + f"\nCould not save: {e}")
+                return
+            self._show_text(info + f"Saved to: {path}\n\nThe file was NOT opened automatically. "
+                                   "Be careful with executable files (.exe, .bat, .js, .vbs…) "
+                                   "from sources you don't trust.")
 
 
 if __name__ == "__main__":
