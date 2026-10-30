@@ -1,11 +1,11 @@
 """
-Doku-Uyarlamalı (Content-Adaptive) DCT-QIM Steganografi  —  v5 (inkâr edilebilir, dosya destekli)
-==================================================================================================
-* Veri yalnızca MAVİ (B) kanalın 8x8 DCT bloklarına (2 orta frekans katsayısı) gömülür.
-* "Karışık / dokulu" bölge skoru, HİÇ DEĞİŞTİRİLMEYEN R ve G kanallarından hesaplanır
-  → çözücü aynı doku haritasını stego görüntüde yeniden üretebilir.
-* Kodlayıcı her bitin yuvalarından yalnızca dokulu olanlara gömer, düz bloklara dokunmaz.
-  Çözücü doku ağırlıklı yumuşak oylama yapar: düz blokların oyu ≈ 0.
+Doku-Uyarlamalı (Content-Adaptive) DCT-QIM Steganografi  —  v6 (yüksek kapasite)
+==================================================================================
+* Veri yalnızca MAVİ (B) kanalın 8x8 DCT bloklarına gömülür.
+* "Karışık / dokulu" bölge skoru, HİÇ DEĞİŞTİRİLMEYEN R ve G kanallarından TAM SAYI
+  aritmetiğiyle hesaplanır → çözücü seçilen blokları birebir aynı bulur.
+* Yalnızca en dokulu %50 blok kullanılır (blok başına 4 katsayı = 4 bit); düz bloklara
+  hiç dokunulmaz. Hata düzeltme: Reed–Solomon (255, 239).
 
 İnkâr edilebilir kasa yapısı
 ----------------------------
@@ -38,6 +38,12 @@ import zlib
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext
 
+try:                                  # Sürükle-bırak isteğe bağlı: pip install tkinterdnd2
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    HAS_DND = True
+except ImportError:
+    HAS_DND = False
+
 import cv2
 import numpy as np
 from argon2.low_level import Type, hash_secret_raw
@@ -47,12 +53,11 @@ from Crypto.Cipher import AES
 # AYARLAR
 # ==========================================
 BLOCK = 8
-COEFS = [(4, 1), (1, 4)]   # Blok başına kullanılan orta frekans katsayıları (satır, sütun)
-SLOTS_PER_BIT = 3          # Her bit için ayrılan (blok, katsayı) yuvası sayısı
-TEXTURE_PERCENTILE = 50    # Skoru bu yüzdeliğin altındaki bloklara normalde DOKUNULMAZ
+COEFS = [(4, 1), (1, 4), (3, 2), (2, 3)]   # Dokulu blok başına 4 orta frekans katsayısı = 4 bit
+TEXTURE_FRACTION = 0.5     # En dokulu %50 blok kullanılır; geri kalanına HİÇ dokunulmaz
 Q_STEP = 24.0              # QIM kuantizasyon adımı
-MIN_MARGIN = 0.6           # Kodlayıcının istediği en düşük ağırlıklı oy farkı
-MAP_SEED = b"stego-dct-map-v4"   # Yuva sırası artık şifreden bağımsız (tüm kasalar paylaşır)
+MAP_SEED = b"stego-dct-map-v6"   # Yuva sırası şifreden bağımsız (tüm kasalar paylaşır)
+RS_N, RS_NSYM = 255, 16    # Reed–Solomon: 255 baytlık kod sözcüğünde 16 eşlik → 8 hatalı bayt düzeltir
 
 # Argon2id parametreleri (RFC 9106'nın düşük bellekli önerisi: t=3, m=64 MiB, p=4)
 ARGON2_TIME = 3
@@ -293,72 +298,256 @@ def open_container(box, password):
 
 
 # ==========================================
-# 4) DOKU HARİTASI
+# 4) DOKU HARİTASI  (tam sayı aritmetiği → her bilgisayarda birebir aynı)
 # ==========================================
 def block_texture(img):
     """
     Her 8x8 blok için 'karmaşıklık' skoru. SADECE R ve G kanalları kullanılır
     (veri B kanalına gömüldüğü için R,G stego görüntüde aynen kalır).
 
-        skor = std(G) + std(R) + std(R - G)
+        skor = var(G) + var(R) + var(R - G)          (64² ile ölçeklenmiş, TAM SAYI)
                └ parlaklık dokusu ┘   └ renk karışıklığı
+
+    Tam sayı kullanılıyor çünkü çözücü hangi blokların seçildiğini BİREBİR aynı bulmalı.
+    Kayan noktalı hesap farklı bilgisayarlarda/kütüphane sürümlerinde son basamakta
+    farklı çıkabilir ve eşikteki bir bloğun seçimi değişebilir.
     """
     h, w = img.shape[:2]
     bh, bw = h // BLOCK, w // BLOCK
-    crop = img[:bh * BLOCK, :bw * BLOCK].astype(np.float32)
-    G, R = crop[:, :, 1], crop[:, :, 2]
+    c = img[:bh * BLOCK, :bw * BLOCK].astype(np.int64)
 
-    def blocks(ch):
-        return ch.reshape(bh, BLOCK, bw, BLOCK).swapaxes(1, 2)
+    def nvar(ch):   # 64 * Σx² − (Σx)²  =  64² · varyans   (kesin)
+        b = ch.reshape(bh, BLOCK, bw, BLOCK).swapaxes(1, 2).reshape(-1, BLOCK * BLOCK)
+        return BLOCK * BLOCK * (b * b).sum(1) - b.sum(1) ** 2
 
-    g, r = blocks(G), blocks(R)
-    score = (g.std(axis=(2, 3)) + r.std(axis=(2, 3)) + (r - g).std(axis=(2, 3))).reshape(-1)
-    return score, bw
-
-
-def texture_params(score):
-    """Eşik T, her blok için oy ağırlığı w ve kuantizasyon adımı Q."""
-    T = max(float(np.percentile(score, TEXTURE_PERCENTILE)), 1.0)
-    rel = score / T
-    w = np.where(rel >= 1.0, 1.0, rel ** 4)            # düz blokların oyu ≈ 0
-    q = np.full(score.shape, Q_STEP)
-    return T, w, q
+    G, R = c[:, :, 1], c[:, :, 2]
+    return nvar(G) + nvar(R) + nvar(R - G), bw
 
 
-def slot_map(n_blocks):
+def textured_blocks(score):
+    """En dokulu TEXTURE_FRACTION oranındaki bloklar (eşitlikte küçük indeks önce). Sıralı döner."""
+    n = score.size
+    m = int(n * TEXTURE_FRACTION)
+    order = np.lexsort((np.arange(n), -score))
+    return np.sort(order[:m])
+
+
+def _mix64(x):
+    """splitmix64 karıştırıcısı (vektörel, uint64 taşması tanımlı). NumPy sürümünden bağımsız."""
+    x = x + np.uint64(0x9E3779B97F4A7C15)
+    x = (x ^ (x >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+    x = (x ^ (x >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+    return x ^ (x >> np.uint64(31))
+
+
+def layout(img):
     """
-    SABİT yuva sırası: (blok, katsayı) çiftlerinin karışık sırası. Şifreden bağımsızdır,
-    çünkü 4 kasa aynı konteyneri paylaşır. Bitleri görüntüye yaymak (gürültüye karşı) için var.
+    Görüntünün gömme düzeni — R ve G kanallarından, şifre olmadan hesaplanır:
+      slots : (yuva sayısı, 2) [blok, katsayı_indeksi]; dokulu her bloğun her katsayısı = 1 bit
+      bw    : satır başına blok sayısı
+      total : toplam blok sayısı
+      size  : sığan konteyner boyutu (bayt, RS eşlikleri düşülmüş)
+    Yuvalar sabit bir karıştırmayla sıralanır: bitler görüntüye yayılır, olası hatalar
+    (ör. parlak bölgede kırpma) tek bir RS kod sözcüğünde toplanmaz. Karıştırma kendi
+    karıştırıcımızla yapılır: NumPy'nin rastgele üreteci sürümler arasında değişebilir ve
+    o zaman başka bilgisayarda çözülemezdi.
     """
-    seed = int.from_bytes(hashlib.sha256(MAP_SEED).digest()[:16], "big")
-    slots = np.arange(n_blocks * len(COEFS))
-    np.random.default_rng(seed).shuffle(slots)
-    return slots   # slot -> blok = s // len(COEFS), katsayı = COEFS[s % len(COEFS)]
+    with np.errstate(over="ignore"):
+        score, bw = block_texture(img)
+        tex = textured_blocks(score)
+        slots = np.stack([np.repeat(tex, len(COEFS)),
+                          np.tile(np.arange(len(COEFS)), tex.size)], axis=1)
+        seed = np.uint64(int.from_bytes(hashlib.sha256(MAP_SEED).digest()[:8], "big"))
+        keys = _mix64(np.arange(len(slots), dtype=np.uint64) ^ seed)
+    slots = slots[np.argsort(keys, kind="stable")]
+    raw = len(slots) // 8
+    k = RS_N - RS_NSYM
+    size = raw * k // RS_N
+    while size > 0 and rs_coded_len(size) > raw:
+        size -= 1
+    while rs_coded_len(size + 1) <= raw:
+        size += 1
+    return {"slots": slots, "bw": bw, "total": score.size, "size": max(0, size)}
 
 
 # ==========================================
-# 4b) HATA DÜZELTME: Hamming(7,4)  — her 7 bitlik kod sözcüğünde 1 hatayı düzeltir
+# 4b) HATA DÜZELTME: Reed–Solomon, GF(256)
 # ==========================================
-_G = np.array([[1,1,0,1],[1,0,1,1],[1,0,0,0],[0,1,1,1],[0,1,0,0],[0,0,1,0],[0,0,0,1]], np.uint8)
-_H = np.array([[1,0,1,0,1,0,1],[0,1,1,0,0,1,1],[0,0,0,1,1,1,1]], np.uint8)
-_DATA_POS = [2, 4, 5, 6]
+# Her RS_N baytlık kod sözcüğü RS_NSYM eşlik baytı taşır ve RS_NSYM/2 hatalı baytı düzeltir.
+# Son parça kısaltılmış kod sözcüğüdür (daha az veri, aynı eşlik sayısı).
+_GF_EXP = [0] * 512
+_GF_LOG = [0] * 256
+_x = 1
+for _i in range(255):
+    _GF_EXP[_i] = _x
+    _GF_LOG[_x] = _i
+    _x <<= 1
+    if _x & 0x100:
+        _x ^= 0x11D                       # ilkel polinom x^8 + x^4 + x^3 + x^2 + 1
+for _i in range(255, 512):
+    _GF_EXP[_i] = _GF_EXP[_i - 255]
 
 
-def hamming_encode(bits):
-    bits = np.concatenate([bits, np.zeros((-len(bits)) % 4, np.uint8)])
-    return (bits.reshape(-1, 4) @ _G.T % 2).astype(np.uint8).ravel()
+def _gf_mul(a, b):
+    return 0 if a == 0 or b == 0 else _GF_EXP[_GF_LOG[a] + _GF_LOG[b]]
 
 
-def hamming_decode(code):
-    c = code.reshape(-1, 7).copy()
-    syn = (c @ _H.T % 2) @ np.array([1, 2, 4])          # hatalı bitin konumu (1..7), 0 = hata yok
-    rows = np.where(syn > 0)[0]
-    c[rows, syn[rows] - 1] ^= 1
-    return c[:, _DATA_POS].ravel()
+def _gf_inv(a):
+    return _GF_EXP[255 - _GF_LOG[a]]
 
 
-def coded_len(n_bits):
-    return -(-n_bits // 4) * 7
+def _poly_mul(p, q):
+    r = [0] * (len(p) + len(q) - 1)
+    for j, qj in enumerate(q):
+        for i, pi in enumerate(p):
+            r[i + j] ^= _gf_mul(pi, qj)
+    return r
+
+
+def _poly_eval(p, x):                     # p[0] en yüksek derece
+    y = p[0]
+    for c in p[1:]:
+        y = _gf_mul(y, x) ^ c
+    return y
+
+
+def _rs_generator(nsym):
+    g = [1]
+    for i in range(nsym):
+        g = _poly_mul(g, [1, _GF_EXP[i]])
+    return g
+
+
+_RS_GEN = {}
+
+
+def rs_encode(msg, nsym):
+    """msg: bayt dizisi (≤ 255 - nsym). Dönen: msg + nsym eşlik baytı."""
+    gen = _RS_GEN.setdefault(nsym, _rs_generator(nsym))
+    buf = list(msg) + [0] * nsym
+    for i in range(len(msg)):
+        c = buf[i]
+        if c:
+            lc = _GF_LOG[c]
+            for j in range(1, len(gen)):
+                if gen[j]:
+                    buf[i + j] ^= _GF_EXP[lc + _GF_LOG[gen[j]]]
+    return bytes(msg) + bytes(buf[len(msg):])
+
+
+def _poly_add(p, q):
+    r = [0] * max(len(p), len(q))
+    for i, c in enumerate(p):
+        r[i + len(r) - len(p)] = c
+    for i, c in enumerate(q):
+        r[i + len(r) - len(q)] ^= c
+    return r
+
+
+def _poly_scale(p, x):
+    return [_gf_mul(c, x) for c in p]
+
+
+def _poly_divmod_rem(dividend, divisor):
+    out = list(dividend)
+    for i in range(len(dividend) - (len(divisor) - 1)):
+        coef = out[i]
+        if coef:
+            for j in range(1, len(divisor)):
+                if divisor[j]:
+                    out[i + j] ^= _gf_mul(divisor[j], coef)
+    sep = -(len(divisor) - 1)
+    return out[sep:]
+
+
+def _gf_pow2(e):
+    return _GF_EXP[e % 255]
+
+
+def rs_decode(code, nsym):
+    """
+    Hataları düzeltip veri kısmını döndürür; düzeltilemezse None.
+    En fazla nsym/2 hatalı bayt düzeltilir. (Berlekamp–Massey + Chien + Forney;
+    Wikiversity "Reed–Solomon codes for coders" referans uygulamasına sadık.)
+    """
+    msg = list(code)
+    synd = [0] + [_poly_eval(msg, _gf_pow2(i)) for i in range(nsym)]
+    if max(synd) == 0:
+        return bytes(msg[:-nsym])
+    # Berlekamp–Massey
+    err_loc, old_loc = [1], [1]
+    shift = len(synd) - nsym
+    for i in range(nsym):
+        K = i + shift
+        delta = synd[K]
+        for j in range(1, len(err_loc)):
+            delta ^= _gf_mul(err_loc[-(j + 1)], synd[K - j])
+        old_loc = old_loc + [0]
+        if delta:
+            if len(old_loc) > len(err_loc):
+                new_loc = _poly_scale(old_loc, delta)
+                old_loc = _poly_scale(err_loc, _gf_inv(delta))
+                err_loc = new_loc
+            err_loc = _poly_add(err_loc, _poly_scale(old_loc, delta))
+    while err_loc and err_loc[0] == 0:
+        err_loc.pop(0)
+    n_err = len(err_loc) - 1
+    if n_err * 2 > nsym:
+        return None
+    # Chien araması
+    rev = err_loc[::-1]
+    nm = len(msg)
+    err_pos = [nm - 1 - i for i in range(nm) if _poly_eval(rev, _gf_pow2(i)) == 0]
+    if len(err_pos) != n_err:
+        return None
+    # Forney
+    coef_pos = [nm - 1 - p for p in err_pos]
+    e_loc = [1]
+    for i in coef_pos:
+        e_loc = _poly_mul(e_loc, _poly_add([1], [_gf_pow2(i), 0]))
+    err_eval = _poly_divmod_rem(_poly_mul(synd[::-1], e_loc), [1] + [0] * len(e_loc))
+    err_eval = err_eval[::-1]
+    X = [_gf_pow2(c) for c in coef_pos]
+    for i, Xi in enumerate(X):
+        Xi_inv = _gf_inv(Xi)
+        denom = 1
+        for j, Xj in enumerate(X):
+            if j != i:
+                denom = _gf_mul(denom, 1 ^ _gf_mul(Xi_inv, Xj))
+        if denom == 0:
+            return None
+        y = _gf_mul(Xi, _poly_eval(err_eval[::-1], Xi_inv))
+        msg[err_pos[i]] ^= _gf_mul(y, _gf_inv(denom))
+    if any(_poly_eval(msg, _gf_pow2(i)) for i in range(nsym)):
+        return None
+    return bytes(msg[:-nsym])
+
+
+def rs_coded_len(n_bytes):
+    k = RS_N - RS_NSYM
+    return n_bytes + RS_NSYM * (-(-n_bytes // k))
+
+
+def rs_encode_all(data):
+    k = RS_N - RS_NSYM
+    return b"".join(rs_encode(data[i:i + k], RS_NSYM) for i in range(0, len(data), k))
+
+
+def rs_decode_all(coded, n_bytes):
+    """Düzeltilmiş veri ve düzeltilemeyen kod sözcüğü sayısı. Düzeltilemeyen parça olduğu gibi bırakılır."""
+    k = RS_N - RS_NSYM
+    out, failed, i, left = [], 0, 0, n_bytes
+    while left > 0:
+        dk = min(k, left)
+        chunk = coded[i:i + dk + RS_NSYM]
+        fixed = rs_decode(chunk, RS_NSYM)
+        if fixed is None:
+            failed += 1
+            fixed = chunk[:dk]
+        out.append(fixed)
+        i += dk + RS_NSYM
+        left -= dk
+    return b"".join(out), failed
 
 
 # ==========================================
@@ -369,21 +558,11 @@ _C = np.array([[np.sqrt((1 if k == 0 else 2) / BLOCK) * np.cos(np.pi * (2 * n + 
                 for n in range(BLOCK)] for k in range(BLOCK)])
 
 
-def _qim_embed(c, bit, q):
-    if bit == 0:
-        return np.round(c / q) * q
-    return np.round((c - q / 2) / q) * q + q / 2
-
-
 def _qim_detect(c, q):
-    """Vektörel: c ve q aynı şekilli diziler olabilir."""
+    """Vektörel: c bir dizi olabilir."""
     d0 = np.abs(c - np.round(c / q) * q)
     d1 = np.abs(c - (np.round((c - q / 2) / q) * q + q / 2))
     return (d1 < d0).astype(np.uint8)
-
-
-def _block_xy(b, bw):
-    return (b // bw) * BLOCK, (b % bw) * BLOCK
 
 
 def _all_coeffs(chan):
@@ -392,96 +571,103 @@ def _all_coeffs(chan):
     bh, bw = h // BLOCK, w // BLOCK
     X = chan[:bh * BLOCK, :bw * BLOCK].astype(np.float64)
     X = X.reshape(bh, BLOCK, bw, BLOCK).swapaxes(1, 2).reshape(-1, BLOCK, BLOCK)
-    return np.stack([np.einsum("i,nij,j->n", _C[u], X, _C[v]) for u, v in COEFS], axis=1)
-
-
-def _write_block(chan, b, bw, targets, q):
-    """targets: {katsayı_indeksi: bit}. Bloğun tüm hedef katsayıları tek seferde yazılır."""
-    y, x = _block_xy(b, bw)
-    d = cv2.dct(chan[y:y + BLOCK, x:x + BLOCK].astype(np.float32))
-    for k, bit in targets.items():
-        u, v = COEFS[k]
-        d[u, v] = _qim_embed(d[u, v], bit, q)
-    out = np.clip(np.round(cv2.idct(d)), 0, 255)
-    chan[y:y + BLOCK, x:x + BLOCK] = out.astype(np.uint8)
+    return np.stack([(X @ _C[v]) @ _C[u] for u, v in COEFS], axis=1)
 
 
 # ==========================================
 # 6) GÖMME / ÇIKARMA  (konteyner baytları ↔ görüntü)
 # ==========================================
-def container_size(img):
-    """Görüntüye sığan konteyner boyutu (bayt). Her gizlemede konteyner TAMAMEN yazılır."""
-    n_slots = (img.shape[0] // BLOCK) * (img.shape[1] // BLOCK) * len(COEFS)
-    return (n_slots // SLOTS_PER_BIT) // 7 * 4 // 8
+def container_size(img, lay=None):
+    """Görüntüye sığan konteyner boyutu (bayt), RS eşlik baytları düşülmüş."""
+    return (lay or layout(img))["size"]
 
 
-def capacity_bytes(img):
-    """Mesajlar için kalan bayt (salt + 4 hücrelik tablo düşülmüş). message_cost() toplamıyla karşılaştırılır."""
-    return max(0, container_size(img) - DATA_START)
+def capacity_bytes(img, lay=None):
+    """Kasalar için kalan bayt (salt + 4 hücrelik tablo düşülmüş)."""
+    return max(0, container_size(img, lay) - DATA_START)
 
 
-def embed_bytes(img, data):
+def _blocks_view(chan, blocks, bw):
+    """Seçilen blokların piksel indeksleri: (len(blocks), 8, 8) şekilli satır/sütun dizileri."""
+    ys = (blocks // bw) * BLOCK
+    xs = (blocks % bw) * BLOCK
+    r = np.arange(BLOCK)
+    return ys[:, None, None] + r[None, :, None], xs[:, None, None] + r[None, None, :]
+
+
+def _write_blocks(chan, orig, blocks, bw, bits, push):
+    """
+    Vektörel gömme: blocks (n,), bits (n, len(COEFS)), push (n, len(COEFS)) kafes kaydırması.
+    Her blok ORİJİNAL piksellerden yeniden hesaplanır (tekrar yazma birikmesin).
+    """
+    Y, X = _blocks_view(chan, blocks, bw)
+    Xb = orig[Y, X].astype(np.float64)
+    D = _C @ Xb @ _C.T                                       # ileri DCT
+    for k, (u, v) in enumerate(COEFS):
+        c = D[:, u, v]
+        q0 = np.round(c / Q_STEP) * Q_STEP
+        q1 = np.round((c - Q_STEP / 2) / Q_STEP) * Q_STEP + Q_STEP / 2
+        D[:, u, v] = np.where(bits[:, k] == 1, q1, q0) + push[:, k] * Q_STEP
+    out = _C.T @ D @ _C                                      # ters DCT (C ortonormal: C⁻¹ = Cᵀ)
+    chan[Y, X] = np.clip(np.round(out), 0, 255).astype(np.uint8)
+
+
+def embed_bytes(img, data, lay=None):
     """Konteyneri görüntüye göm. (stego, kullanılan_bloklar, istatistik) döndürür."""
-    score, bw = block_texture(img)
-    T, w, q = texture_params(score)
-    slots = slot_map(score.size)
-    bits = hamming_encode(np.unpackbits(np.frombuffer(data, np.uint8)))
-    if bits.size * SLOTS_PER_BIT > slots.size:
+    lay = lay or layout(img)
+    slots, bw = lay["slots"], lay["bw"]
+    coded = rs_encode_all(data)
+    bits = np.unpackbits(np.frombuffer(coded, np.uint8))
+    if bits.size > len(slots):
         raise ValueError("Container does not fit in this image.")
+    # Konteyner kapasiteyi tam doldurmayabilir (bayt yuvarlaması); kalan yuvalara da rastgele
+    # bit yazılır ki dokulu blokların TAMAMI aynı şekilde değişmiş olsun.
+    fill = np.unpackbits(np.frombuffer(secrets.token_bytes(-(-(len(slots) - bits.size) // 8)), np.uint8))
+    all_bits = np.concatenate([bits, fill[:len(slots) - bits.size]])
 
-    K, nc = SLOTS_PER_BIT, len(COEFS)
-    rows = slots[:bits.size * K].reshape(-1, K)
-    blk, kk = rows // nc, rows % nc
-    det_orig = _qim_detect(_all_coeffs(img[:, :, 0])[blk, kk], q[blk])   # dokunulmasa ne okunur
-    wts, sc = w[blk], score[blk]
-    textured = sc >= T
+    blocks = np.unique(slots[:, 0])                 # dokulu bloklar (sıralı)
+    row = np.searchsorted(blocks, slots[:, 0])      # yuva → blok satırı
+    B = np.zeros((blocks.size, len(COEFS)), np.uint8)
+    B[row, slots[:, 1]] = all_bits
+    push = np.zeros(B.shape, np.int8)
 
-    # 1) Önce yalnızca dokulu yuvalar. Çözücünün ağırlıklı oyunu simüle et.
-    chosen = textured.copy()
-    agree_nat = (det_orig == bits[:, None])
-    tot = wts.sum(1)
-
-    def margin(ch):
-        agree = (wts * (ch | (~ch & agree_nat))).sum(1)
-        return np.where(tot > 0, (2 * agree - tot) / np.maximum(tot, 1e-12), -1)
-
-    # 2) Fark yetersizse kalan yuvaları en dokuludan başlayarak ekle (nadiren düz bloğa dokunur)
-    forced = 0
-    for i in np.where(margin(chosen) < MIN_MARGIN)[0]:
-        for j in np.argsort(-sc[i]):
-            if chosen[i, j]:
-                continue
-            chosen[i, j] = True
-            forced += 1
-            a = (wts[i] * (chosen[i] | (~chosen[i] & agree_nat[i]))).sum()
-            if tot[i] > 0 and (2 * a - tot[i]) / tot[i] >= MIN_MARGIN:
-                break
-
-    plan = {}                                       # blok -> {katsayı: bit}
-    for i, j in zip(*np.nonzero(chosen)):
-        plan.setdefault(int(blk[i, j]), {})[int(kk[i, j])] = int(bits[i])
-
+    orig = img[:, :, 0]
     stego = img.copy()
     chan = stego[:, :, 0]                           # B kanalı
-    for b, targets in plan.items():
-        _write_block(chan, b, bw, targets, q[b])
+    _write_blocks(chan, orig, blocks, bw, B, push)
 
-    return stego, np.array(sorted(plan)), {"used": len(plan), "total": score.size, "forced_flat": forced}
+    # Doğrula ve düzelt: kırpma (0/255'e dayanan pikseller) nadiren bir biti bozar.
+    # Hatalı katsayıyı aynı bit için bir sonraki kafes noktasına kaydırıp bloğu yeniden yaz.
+    # Hâlâ kalan birkaç hata Reed–Solomon ile düzeltilir.
+    tries = np.array([0, 1, -1, 2, -2], np.int8)
+    rounds = 0
+    for _ in range(len(tries) - 1):
+        det = _qim_detect(_all_coeffs(chan)[slots[:, 0], slots[:, 1]], Q_STEP)
+        bad = np.nonzero(det != all_bits)[0]
+        if bad.size == 0:
+            break
+        rounds += 1
+        r, k = row[bad], slots[bad, 1]
+        cur = np.array([np.nonzero(tries == p)[0][0] for p in push[r, k]])
+        push[r, k] = tries[(cur + 1) % len(tries)]
+        redo = np.unique(r)
+        _write_blocks(chan, orig, blocks[redo], bw, B[redo], push[redo])
+    det = _qim_detect(_all_coeffs(chan)[slots[:, 0], slots[:, 1]], Q_STEP)
+    residual = int((det != all_bits).sum())
+
+    stats = {"used": int(blocks.size), "total": int(lay["total"]),
+             "fixed_rounds": rounds, "residual_bit_errors": residual}
+    return stego, blocks, stats
 
 
-def extract_bytes(img):
+def extract_bytes(img, lay=None):
     """Görüntüdeki konteyneri okur (şifre gerekmez; içerik şifreli/rastgele)."""
-    score, bw = block_texture(img)
-    _, w, q = texture_params(score)
-    slots = slot_map(score.size)
-    n_bits = coded_len(container_size(img) * 8)
-    K, nc = SLOTS_PER_BIT, len(COEFS)
-    rows = slots[:n_bits * K].reshape(-1, K)
-    blk, kk = rows // nc, rows % nc
-    det = _qim_detect(_all_coeffs(img[:, :, 0])[blk, kk], q[blk])
-    acc = (w[blk] * (2.0 * det - 1)).sum(1)          # doku ağırlıklı yumuşak oylama
-    bits = hamming_decode((acc > 0).astype(np.uint8))[:container_size(img) * 8]
-    return np.packbits(bits).tobytes()
+    lay = lay or layout(img)
+    slots, size = lay["slots"], lay["size"]
+    n_bits = rs_coded_len(size) * 8
+    det = _qim_detect(_all_coeffs(img[:, :, 0])[slots[:n_bits, 0], slots[:n_bits, 1]], Q_STEP)
+    data, _failed = rs_decode_all(np.packbits(det).tobytes(), size)
+    return data
 
 
 def embed_data(image_path, output_path, items, map_path=None):
@@ -491,27 +677,29 @@ def embed_data(image_path, output_path, items, map_path=None):
         return f"ERROR: Could not read image!\nPath: {image_path}"
     if not items:
         return "ERROR: Nothing to hide."
+    lay = layout(img)                              # bir kez hesapla, her yerde kullan
     try:
-        box = build_container(container_size(img), items)
-        stego, used, st = embed_bytes(img, box)
+        box = build_container(lay["size"], items)
+        stego, used, st = embed_bytes(img, box, lay)
     except ValueError as e:
         return f"ERROR: {e}"
 
     # Kendi kendini doğrulama: konteyner bayt bayt geri okunabiliyor mu?
     # (Şifre gerektirmez → ek Argon2 maliyeti yok, üstelik tüm kasaları birden kontrol eder.)
+    # Stego görüntünün düzeni R,G'den YENİDEN hesaplanır: çözücünün göreceği şeyin aynısı.
     ok = extract_bytes(stego) == box
     if not ok:
         return "ERROR: Self-check failed, the data could not be read back. Try a different image."
     if not save_image_unicode(output_path, stego):
         return f"ERROR: Could not save image!\nPath: {output_path}"
     if map_path:
-        _, bw = block_texture(img)
-        save_usage_map(img, used, bw, map_path)
+        save_usage_map(img, used, lay["bw"], map_path)
     used_b = sum(payload_cost(p) for p, _ in items)
     return (f"Success\nLockers filled: {len(items)} (image always has {N_LOCKERS} lockers)\n"
-            f"Used: {used_b}/{capacity_bytes(img)} bytes, rest filled with random data\n"
+            f"Used: {used_b}/{capacity_bytes(img, lay)} bytes, rest filled with random data\n"
             f"Modified blocks: {st['used']}/{st['total']} "
-            f"(%{100 * st['used'] / st['total']:.1f}); low-texture slots touched: {st['forced_flat']}\n"
+            f"(%{100 * st['used'] / st['total']:.1f}, textured only; flat blocks untouched)\n"
+            f"Raw bit errors left for Reed-Solomon: {st['residual_bit_errors']}\n"
             f"Self-check: OK")
 
 
@@ -555,6 +743,7 @@ def psnr(a, b):
 # 8) GUI
 # ==========================================
 METER_COLORS = {"ok": "#2e7d32", "warn": "#f9a825", "over": "#c62828"}
+IMAGE_EXTS = (".png", ".bmp", ".jpg", ".jpeg", ".tif", ".tiff", ".webp")
 BG, PANEL, FIELD, MUTED = "#1e1e1e", "#252526", "#333", "#aaa"
 
 
@@ -622,7 +811,7 @@ class CapacityMeter(tk.Frame):
 class StegoApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("AES Steganography Tool v5 (Deniable Lockers + Files)")
+        self.root.title("AES Steganography Tool v6 (Deniable Lockers + Files)")
         self.root.geometry("640x700")
         self.root.configure(bg=BG)
         self.file_path = None
@@ -635,7 +824,7 @@ class StegoApp:
         self.setup_ui()
 
     def setup_ui(self):
-        tk.Label(self.root, text="AES Crypto-Stego Station v5", fg="#00ff00", bg=BG,
+        tk.Label(self.root, text="AES Crypto-Stego Station v6", fg="#00ff00", bg=BG,
                  font=("Courier", 18, "bold")).pack(pady=15)
         self.mode = tk.StringVar(value="ENCODE")
         tf = tk.Frame(self.root, bg=BG); tf.pack(pady=5)
@@ -742,6 +931,12 @@ class StegoApp:
         self.btn.pack(pady=10)
         self.lbl_status = tk.Label(self.main_frame, text="", fg=MUTED, bg=PANEL, justify="left")
         self.lbl_status.pack()
+        tip = ("Tip: drag & drop an image here. Drop a file onto the file panel to hide it."
+               if HAS_DND else "Drag & drop: pip install tkinterdnd2")
+        if not enc and HAS_DND:
+            tip = "Tip: drag & drop a stego image here."
+        tk.Label(self.main_frame, text=tip, fg="#777", bg=PANEL, font=("Arial", 8)).pack(side="bottom")
+        self._register_drop_targets(self.root)
         self.update_capacity()
 
     # ---------------- kasalar ----------------
@@ -782,8 +977,13 @@ class StegoApp:
 
     def choose_file(self):
         p = filedialog.askopenfilename(title="Choose a file to hide")
-        if not p:
-            return
+        if p:
+            self.load_locker_file(p)
+
+    def load_locker_file(self, p):
+        """Dosyayı düzenlenen kasaya koyar (diyalogdan ya da sürükle-bıraktan)."""
+        if os.path.isdir(p):
+            return messagebox.showerror("Error", "Folders can't be hidden. Zip the folder first.")
         try:
             size = os.path.getsize(p)
             if size > MAX_FILE_BYTES:
@@ -813,7 +1013,8 @@ class StegoApp:
             return
         comp = " (compressed)" if l["file_payload"][0] & FLAG_COMPRESSED else ""
         self.lbl_file.config(text=f"{l['file_name']}\n{human_size(l['file_size'])}  →  "
-                                  f"takes {human_size(locker_cost(l))} in the image{comp}", fg="#00ff00")
+                                  f"takes {human_size(payload_cost(l['file_payload']))} in the image{comp}",
+                             fg="#00ff00")
 
     def _style_locker_buttons(self):
         for i, b in enumerate(self.locker_btns):
@@ -861,14 +1062,61 @@ class StegoApp:
     def select_file(self):
         p = filedialog.askopenfilename(filetypes=[("Image Files", "*.png *.bmp *.jpg *.jpeg *.tif *.tiff")])
         if p:
-            img = read_image_unicode(p)
-            if img is None:
-                return messagebox.showerror("Error", f"Could not read image:\n{p}")
-            self.file_path = p
-            self.capacity = capacity_bytes(img)
-            self.image_size = (img.shape[1], img.shape[0])
-            self._update_path_label()
-            self.update_capacity()
+            self.load_image(p)
+
+    def load_image(self, p):
+        """Kapak / stego görüntüsünü yükler (diyalogdan ya da sürükle-bıraktan)."""
+        img = read_image_unicode(p)
+        if img is None:
+            return messagebox.showerror("Error", f"Could not read image:\n{p}")
+        self.file_path = p
+        self.capacity = capacity_bytes(img)
+        self.image_size = (img.shape[1], img.shape[0])
+        self._update_path_label()
+        self.update_capacity()
+
+    # ---------------- sürükle-bırak ----------------
+    def _register_drop_targets(self, widget):
+        """Pencere ve içindeki her widget bırakma hedefi olur (bırakma alt widget'a gelir)."""
+        if not HAS_DND:
+            return
+        try:
+            widget.drop_target_register(DND_FILES)
+            widget.dnd_bind("<<Drop>>", self.on_drop)
+        except (AttributeError, tk.TclError):
+            pass
+        for child in widget.winfo_children():
+            self._register_drop_targets(child)
+
+    def _in_file_panel(self, widget):
+        return widget is not None and str(widget).startswith(str(self.file_frame))
+
+    def on_drop(self, event):
+        """
+        Bırakılan şey nereye gider?
+          • Dosya panelinin üstüne bırakılan her şey → düzenlenen kasaya DOSYA olarak
+            (bir resmi gizlemek istiyorsan onu dosya paneline bırak)
+          • Gizleme modunda, dosya paneli dışına bırakılan resim → kapak görüntüsü
+          • Gizleme modunda resim olmayan dosya → düzenlenen kasaya dosya olarak
+          • Çözme modunda → stego görüntüsü
+        """
+        paths = self.root.tk.splitlist(event.data)    # boşluklu yollar {…} içinde gelir
+        if not paths or self.busy:
+            return event.action if hasattr(event, "action") else None
+        p = paths[0]
+        is_image = os.path.splitext(p)[1].lower() in IMAGE_EXTS
+        widget = getattr(event, "widget", None)
+        if self.encoding and (self._in_file_panel(widget) or not is_image):
+            self.kind_var.set("file")
+            self._show_content("file")
+            self.load_locker_file(p)
+        elif is_image:
+            self.load_image(p)
+        else:
+            messagebox.showerror("Error", "Drop an image (PNG/BMP/TIFF/JPG) to reveal.")
+        if len(paths) > 1:
+            self.lbl_status.config(text=f"Only the first of {len(paths)} dropped items was used.")
+        return getattr(event, "action", None)
 
     # ---------------- çalıştır ----------------
     def run(self):
@@ -887,6 +1135,10 @@ class StegoApp:
             if len(set(pwds)) != len(pwds):
                 return messagebox.showerror("Error", "Each locker must have a different password.")
             items = [(locker_payload(l), l["pwd"]) for _, l in filled]
+            need = sum(payload_cost(p) for p, _ in items)
+            if self.capacity is not None and need > self.capacity:
+                return messagebox.showerror("Error", f"Content is too large: {need} bytes, "
+                                                     f"capacity is {self.capacity} bytes.")
             base = os.path.splitext(os.path.basename(self.file_path))[0]
             out = filedialog.asksaveasfilename(defaultextension=".png", initialfile=f"{base}_stego.png",
                                                filetypes=[("PNG", "*.png"), ("BMP", "*.bmp")])
@@ -963,6 +1215,6 @@ class StegoApp:
 
 
 if __name__ == "__main__":
-    root = tk.Tk()
+    root = TkinterDnD.Tk() if HAS_DND else tk.Tk()
     StegoApp(root)
     root.mainloop()
